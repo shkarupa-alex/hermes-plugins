@@ -19,6 +19,7 @@ Live capability result for the `hermes-vk-community` release gate.
 | `<ul><li>…</li></ul>` in `message` | accepted | tags displayed literally |
 | `<table>…</table>` in `message` | accepted | tags displayed literally |
 | Bare HTTPS URL | accepted | rendered as a clickable link |
+| Markdown list degraded to `•` lines | accepted | compact list without blank lines between items |
 | `messages.setActivity(type="typing")` | response `1` | typing status visibly displayed |
 
 The official VK API `5.199` schema exposes neither `format_data` nor another
