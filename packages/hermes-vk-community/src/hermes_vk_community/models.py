@@ -34,12 +34,39 @@ class LongPollResponse(VkModel):
     failed: int | None = None
 
 
+class PhotoSize(VkModel):
+    url: str
+    width: int = 0
+    height: int = 0
+
+
+class PhotoAttachment(VkModel):
+    sizes: list[PhotoSize] = Field(default_factory=list[PhotoSize])
+
+
+class DocumentAttachment(VkModel):
+    url: str | None = None
+    title: str = "document"
+    ext: str = ""
+
+
+class AudioMessageAttachment(VkModel):
+    link_ogg: str | None = None
+    link_mp3: str | None = None
+    duration: int = 0
+
+
+class AudioAttachment(VkModel):
+    url: str | None = None
+    title: str = "audio"
+
+
 class VkAttachment(VkModel):
     type: str
-    photo: JsonObject | None = None
-    doc: JsonObject | None = None
-    audio_message: JsonObject | None = None
-    audio: JsonObject | None = None
+    photo: PhotoAttachment | None = None
+    doc: DocumentAttachment | None = None
+    audio_message: AudioMessageAttachment | None = None
+    audio: AudioAttachment | None = None
     video: JsonObject | None = None
     sticker: JsonObject | None = None
     link: JsonObject | None = None

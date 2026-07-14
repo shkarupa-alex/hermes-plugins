@@ -8,14 +8,22 @@ from typing import Any, Never
 
 from agent.secret_scope import get_secret
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, cache_media_bytes
 from hermes_constants import get_hermes_home
 from pydantic import TypeAdapter
 
 from hermes_vk_community.client import VkApiClient
 from hermes_vk_community.config import PolicyEnvironment, VkSettings, settings_from_platform_config
 from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError
-from hermes_vk_community.models import Group, GroupsResponse, LongPollLease, MessageNewObject, User, VkUpdate
+from hermes_vk_community.models import (
+    Group,
+    GroupsResponse,
+    LongPollLease,
+    MessageNewObject,
+    User,
+    VkAttachment,
+    VkUpdate,
+)
 from hermes_vk_community.renderer import PlainVkRenderer, split_message
 from hermes_vk_community.storage import InboxRecord, VkStorage
 
@@ -62,7 +70,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         if not token:
             self._set_fatal_error("vk_missing_token", "VK_COMMUNITY_TOKEN is missing", retryable=False)
             return False
-        if not self._acquire_platform_lock("vk", str(self.settings.group_id), "VK community"):
+        lock_held = getattr(self, "_platform_lock_identity", None) is not None
+        if not lock_held and not self._acquire_platform_lock("vk", str(self.settings.group_id), "VK community"):
             return False
         try:
             self._client = VkApiClient(token, api_version=self.settings.api_version, media=self.settings.media)
@@ -293,9 +302,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 await self._storage.mark_inbox(record.id, "quarantined", "sender is not authorized")
                 return
             parsed = self._renderer.parse_incoming(message.text, None)
-            attachment_text = _attachment_descriptions(message.attachments)
+            media_urls, media_types, is_voice, attachment_text = await self._cache_attachments(message.attachments)
             text = "\n".join(part for part in (parsed.markdown, attachment_text) if part).strip()
-            if not text:
+            if not text and not media_urls:
                 await self._storage.mark_inbox(record.id, "quarantined", "empty message")
                 return
             source = self.build_source(
@@ -306,17 +315,56 @@ class VkCommunityAdapter(BasePlatformAdapter):
             )
             event = MessageEvent(
                 text=text,
-                message_type=MessageType.TEXT,
+                message_type=MessageType.VOICE if is_voice else MessageType.TEXT,
                 source=source,
                 raw_message=message.model_dump(mode="json"),
                 message_id=str(message.id),
                 reply_to_message_id=str(message.reply_message.get("id")) if message.reply_message else None,
+                media_urls=media_urls,
+                media_types=media_types,
                 metadata={"vk_event_id": update.event_id, "vk_format_data": None},
             )
             await self._storage.mark_inbox(record.id, "dispatched")
             await self.handle_message(event)
         except Exception as exc:  # noqa: BLE001
             await self._storage.mark_inbox(record.id, "quarantined", f"{type(exc).__name__}: {exc}")
+
+    async def _cache_attachments(
+        self,
+        attachments: list[VkAttachment],
+    ) -> tuple[list[str], list[str], bool, str]:
+        if self._client is None:
+            raise RuntimeError("VK client is not connected")
+        paths: list[str] = []
+        media_types: list[str] = []
+        descriptions: list[str] = []
+        is_voice = False
+        for attachment in attachments:
+            candidate = _attachment_candidate(attachment)
+            if candidate is None:
+                descriptions.append(_attachment_description(attachment))
+                continue
+            url, filename, default_kind, voice = candidate
+            try:
+                downloaded = await self._client.download_media(url)
+                cached = cache_media_bytes(
+                    downloaded.data,
+                    filename=filename,
+                    mime_type=downloaded.content_type,
+                    default_kind=default_kind,
+                )
+            except Exception as exc:  # noqa: BLE001 - attachment failure must not drop the admitted text
+                logger.warning("[vk] attachment %s download failed: %s", attachment.type, type(exc).__name__)
+                descriptions.append(f"[{_attachment_description(attachment)}: загрузка не удалась]")
+                continue
+            if cached is None:
+                descriptions.append(f"[{_attachment_description(attachment)}: неподдерживаемый формат]")
+                continue
+            paths.append(cached.path)
+            media_types.append(cached.media_type)
+            descriptions.append(cached.context_note())
+            is_voice = is_voice or voice
+        return paths, media_types, is_voice, "\n".join(descriptions)
 
     async def _stop_polling(self) -> None:
         task, self._poll_task = self._poll_task, None
@@ -372,17 +420,35 @@ def _partial_result(delivered: list[str], total: int) -> SendResult:
     )
 
 
-def _attachment_descriptions(attachments: list[Any]) -> str:
+def _attachment_description(attachment: VkAttachment) -> str:
     labels = {
-        "photo": "[Фотография]",
-        "doc": "[Документ]",
-        "audio_message": "[Голосовое сообщение — загрузка будет добавлена в следующем срезе]",
-        "audio": "[Аудиозапись]",
-        "video": "[Видео]",
-        "sticker": "[Стикер]",
-        "link": "[Ссылка]",
+        "photo": "Фотография",
+        "doc": "Документ",
+        "audio_message": "Голосовое сообщение",
+        "audio": "Аудиозапись",
+        "video": "Видео",
+        "sticker": "Стикер",
+        "link": "Ссылка",
     }
-    return "\n".join(labels.get(item.type, f"[Вложение: {item.type}]") for item in attachments)
+    return labels.get(attachment.type, f"Вложение: {attachment.type}")
+
+
+def _attachment_candidate(attachment: VkAttachment) -> tuple[str, str, str, bool] | None:
+    if attachment.type == "audio_message" and attachment.audio_message is not None:
+        url = attachment.audio_message.link_ogg or attachment.audio_message.link_mp3
+        if url:
+            return url, "voice.ogg" if attachment.audio_message.link_ogg else "voice.mp3", "audio", True
+    if attachment.type == "photo" and attachment.photo is not None and attachment.photo.sizes:
+        largest = max(attachment.photo.sizes, key=lambda size: size.width * size.height)
+        return largest.url, "photo.jpg", "image", False
+    if attachment.type == "doc" and attachment.doc is not None and attachment.doc.url:
+        filename = attachment.doc.title
+        if attachment.doc.ext and not filename.lower().endswith(f".{attachment.doc.ext.lower()}"):
+            filename = f"{filename}.{attachment.doc.ext}"
+        return attachment.doc.url, filename, "document", False
+    if attachment.type == "audio" and attachment.audio is not None and attachment.audio.url:
+        return attachment.audio.url, f"{attachment.audio.title}.mp3", "audio", False
+    return None
 
 
 def _raise_unsupported_failure(code: int) -> Never:
