@@ -1,10 +1,13 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
+from hermes_cli.config import get_env_value
+
 from hermes_vk_community.adapter import VkCommunityAdapter
 from hermes_vk_community.cli import handle_command, setup_parser
 from hermes_vk_community.compat import check_requirements
 from hermes_vk_community.config import apply_yaml_config, validate_config
+from hermes_vk_community.setup import interactive_setup
 
 if TYPE_CHECKING:
     from gateway.config import PlatformConfig
@@ -20,6 +23,11 @@ def build_adapter(config: PlatformConfig) -> VkCommunityAdapter:
     return VkCommunityAdapter(config)
 
 
+def is_connected(_config: PlatformConfig) -> bool:
+    """Report profile-scoped credential presence to Hermes setup and gateway discovery."""
+    return bool((get_env_value("VK_COMMUNITY_TOKEN") or "").strip())
+
+
 def register(ctx: PluginContext) -> None:
     ctx.register_platform(
         name="vk",
@@ -27,8 +35,10 @@ def register(ctx: PluginContext) -> None:
         adapter_factory=build_adapter,
         check_fn=check_requirements,
         validate_config=validate_config,
+        is_connected=is_connected,
         apply_yaml_config_fn=apply_yaml_config,
         required_env=["VK_COMMUNITY_TOKEN"],
+        setup_fn=interactive_setup,
         max_message_length=4096,
         allow_update_command=False,
         pii_safe=True,

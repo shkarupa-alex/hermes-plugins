@@ -9,6 +9,7 @@ from agent.secret_scope import get_secret
 from hermes_vk_community.client import VkApiClient
 from hermes_vk_community.compat import check_compatibility
 from hermes_vk_community.config import API_VERSION
+from hermes_vk_community.setup import interactive_setup
 
 if TYPE_CHECKING:
     import argparse
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 
 def setup_parser(parser: argparse.ArgumentParser) -> None:
     subparsers = parser.add_subparsers(dest="vk_command", required=True)
-    subparsers.add_parser("setup", help="Print the minimal VK configuration")
+    subparsers.add_parser("setup", help="Run the interactive VK Community setup wizard")
     subparsers.add_parser("test-auth", help="Validate the scoped community token")
     doctor = subparsers.add_parser("doctor", help="Check Hermes and local VK state")
     doctor.add_argument("--inflight", action="store_true", help="Show ambiguous inbox work")
@@ -28,6 +29,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> None:
 def handle_command(args: argparse.Namespace) -> int:
     command = args.vk_command
     if command == "setup":
+        interactive_setup()
         return 0
     if command == "doctor":
         compatible, _message = check_compatibility()

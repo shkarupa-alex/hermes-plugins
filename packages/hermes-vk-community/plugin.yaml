@@ -6,8 +6,8 @@ description: VK Community Long Poll gateway adapter for Hermes Agent.
 author: Hermes VK Community contributors
 requires_env:
   - name: VK_COMMUNITY_TOKEN
-    description: Community access token with messages and groups permissions
+    description: VK community access token with messages, management, photos, and documents permissions
     prompt: VK Community token
+    url: https://dev.vk.com/ru/api/bots/getting-started
     password: true
     category: credential
-

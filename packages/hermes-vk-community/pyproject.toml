@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.entry-points."hermes_agent.plugins"]
-"vk-community" = "hermes_vk_community.plugin:register"
+"vk-community" = "hermes_vk_community"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_vk_community"]
