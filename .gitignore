@@ -9,3 +9,6 @@ __pycache__/
 build/
 dist/
 htmlcov/
+.env
+.env.*
+!.env.example

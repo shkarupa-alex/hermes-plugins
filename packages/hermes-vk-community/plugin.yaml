@@ -1,0 +1,13 @@
+name: vk-community
+label: VK Community
+kind: platform
+version: 0.1.0
+description: VK Community Long Poll gateway adapter for Hermes Agent.
+author: Hermes VK Community contributors
+requires_env:
+  - name: VK_COMMUNITY_TOKEN
+    description: Community access token with messages and groups permissions
+    prompt: VK Community token
+    password: true
+    category: credential
+
