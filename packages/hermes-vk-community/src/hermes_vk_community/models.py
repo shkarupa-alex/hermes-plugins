@@ -121,6 +121,8 @@ class User(VkModel):
 class Group(VkModel):
     id: int
     name: str = ""
+    type: str = ""
+    is_closed: int | None = None
 
 
 class GroupsResponse(VkModel):

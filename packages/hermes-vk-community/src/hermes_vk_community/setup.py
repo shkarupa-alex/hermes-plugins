@@ -13,10 +13,15 @@ from hermes_vk_community.models import CommunityLongPollSettings, Group, GroupsR
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Protocol
+
+    class VkApiCaller(Protocol):
+        async def call(self, method: str, params: dict[str, object]) -> object: ...
 
 
 VK_BOTS_GUIDE = "https://dev.vk.com/ru/api/bots/getting-started"
 VK_COMMUNITY_URL = "https://vk.com/groups"
+PRIVATE_GROUP_ACCESS = 2
 
 
 class ResolvedScreenName(BaseModel):
@@ -74,7 +79,13 @@ async def _resolve_object(client: VkApiClient, value: str, *, expected_type: str
     return resolved.object_id
 
 
-async def inspect_vk_setup(token: str, group_ref: str, user_refs: list[str]) -> VkSetupResult:
+async def inspect_vk_setup(
+    token: str,
+    group_ref: str,
+    user_refs: list[str],
+    *,
+    configure_community: bool = False,
+) -> VkSetupResult:
     """Validate credentials, resolve human-friendly VK links, and test Long Poll."""
     clean_token = token.strip()
     if not clean_token:
@@ -85,13 +96,13 @@ async def inspect_vk_setup(token: str, group_ref: str, user_refs: list[str]) -> 
     client = VkApiClient(clean_token)
     try:
         group_id = await _resolve_object(client, group_ref, expected_type="group")
-        groups_payload = await client.call("groups.getById", {"group_id": group_id})
-        if isinstance(groups_payload, dict):
-            groups = GroupsResponse.model_validate(groups_payload).groups
-        else:
-            groups = TypeAdapter(list[Group]).validate_python(groups_payload)
-        if not groups or groups[0].id != group_id:
-            raise ValueError("VK token cannot access the selected community")
+        group = await _load_group(client, group_id)
+
+        if configure_community:
+            await configure_private_community(client, group_id)
+            group = await _load_group(client, group_id)
+        if group.is_closed != PRIVATE_GROUP_ACCESS:
+            raise ValueError("VK community must be private (access=2)")
 
         allowed_user_ids: list[int] = []
         for reference in user_refs:
@@ -109,11 +120,25 @@ async def inspect_vk_setup(token: str, group_ref: str, user_refs: list[str]) -> 
         await client.get_long_poll_lease(group_id)
         return VkSetupResult(
             group_id=group_id,
-            group_name=groups[0].name,
+            group_name=group.name,
             allowed_user_ids=allowed_user_ids,
         )
     finally:
         await client.close()
+
+
+async def _load_group(client: VkApiCaller, group_id: int) -> Group:
+    payload = await client.call("groups.getById", {"group_id": group_id})
+    if isinstance(payload, dict):
+        groups = GroupsResponse.model_validate(payload).groups
+    else:
+        groups = TypeAdapter(list[Group]).validate_python(payload)
+    if not groups or groups[0].id != group_id:
+        raise ValueError("VK token cannot access the selected community")
+    group = groups[0]
+    if group.type != "group":
+        raise ValueError("Hermes requires a VK group; public pages and events cannot be made private")
+    return group
 
 
 def validate_long_poll_capabilities(settings: CommunityLongPollSettings) -> None:
@@ -126,6 +151,27 @@ def validate_long_poll_capabilities(settings: CommunityLongPollSettings) -> None
         )
     if settings.events.message_new != 1:
         raise ValueError("Community Long Poll event 'message_new' (incoming messages) is disabled")
+
+
+async def configure_private_community(client: VkApiCaller, group_id: int) -> None:
+    """Apply the minimal VK-side configuration required by the adapter."""
+    await client.call(
+        "groups.edit",
+        {
+            "group_id": group_id,
+            "access": PRIVATE_GROUP_ACCESS,
+            "messages": True,
+        },
+    )
+    await client.call(
+        "groups.setLongPollSettings",
+        {
+            "group_id": group_id,
+            "enabled": True,
+            "api_version": API_VERSION,
+            "message_new": True,
+        },
+    )
 
 
 def interactive_setup() -> None:
@@ -162,9 +208,22 @@ def interactive_setup() -> None:
     raw_users = prompt("Allowed VK users (comma-separated)")
     user_refs = [item.strip() for item in raw_users.split(",") if item.strip()]
 
+    print_info("")
+    print_info("Recommended hardening makes the community private and enables the required VK features:")
+    print_info("community messages, Community Long Poll 5.199, and incoming-message events.")
+    print_info("Hermes access remains independently restricted by the allowed-user list above.")
+    configure_community = prompt_yes_no("Apply the recommended private bot configuration?", default=True)
+
     print_info("Validating the token, IDs, permissions, and Community Long Poll...")
     try:
-        result = asyncio.run(inspect_vk_setup(token, group_ref, user_refs))
+        result = asyncio.run(
+            inspect_vk_setup(
+                token,
+                group_ref,
+                user_refs,
+                configure_community=configure_community,
+            ),
+        )
     except Exception as exc:  # noqa: BLE001 - setup boundary must return a friendly diagnostic
         print_error(f"VK setup validation failed: {exc}")
         print_info("Nothing was saved. Check the token permissions and Long Poll settings, then retry.")
@@ -173,6 +232,7 @@ def interactive_setup() -> None:
     save_env_value("VK_COMMUNITY_TOKEN", token)
     write_setup_config(write_platform_config_field, result)
     print_success(f"VK Community configured: {result.group_name} (ID {result.group_id})")
+    print_success("The VK community is private; messages and the required Long Poll event are enabled.")
     print_success("Only these VK user IDs are allowed: " + ", ".join(map(str, result.allowed_user_ids)))
     print_info("The token was stored as VK_COMMUNITY_TOKEN in the active Hermes profile's .env.")
     print_info("Non-secret IDs were stored under platforms.vk in config.yaml.")

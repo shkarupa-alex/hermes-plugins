@@ -7,6 +7,7 @@ from hermes_vk_community import setup
 from hermes_vk_community.models import CommunityLongPollSettings
 from hermes_vk_community.setup import (
     VkSetupResult,
+    configure_private_community,
     interactive_setup,
     numeric_id_from_reference,
     screen_name_from_reference,
@@ -59,6 +60,27 @@ def test_long_poll_validation_accepts_required_capabilities() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_private_community_configuration_uses_minimal_vk_settings() -> None:
+    class ClientSpy:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def call(self, method: str, params: dict[str, object]) -> object:
+            self.calls.append((method, params))
+            return 1
+
+    client = ClientSpy()
+    await configure_private_community(client, 240186772)
+    assert client.calls == [
+        ("groups.edit", {"group_id": 240186772, "access": 2, "messages": True}),
+        (
+            "groups.setLongPollSettings",
+            {"group_id": 240186772, "enabled": True, "api_version": "5.199", "message_new": True},
+        ),
+    ]
+
+
 def test_write_setup_config_uses_non_secret_yaml_fields_only() -> None:
     writes: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
@@ -98,6 +120,9 @@ def test_interactive_setup_saves_token_in_profile_env_and_ids_in_yaml(monkeypatc
     def output_stub(_message: str) -> None:
         return None
 
+    def yes_stub(*_args: Any, **_kwargs: Any) -> bool:  # noqa: ANN401 - mirrors generic Hermes prompt
+        return True
+
     monkeypatch.setattr(setup, "get_env_value", get_env_value_stub)
     monkeypatch.setattr(setup, "save_env_value", save_env_value_stub)
     monkeypatch.setattr(setup, "write_platform_config_field", write_config_stub)
@@ -106,11 +131,19 @@ def test_interactive_setup_saves_token_in_profile_env_and_ids_in_yaml(monkeypatc
     monkeypatch.setattr(setup, "print_header", output_stub)
     monkeypatch.setattr(setup, "print_info", output_stub)
     monkeypatch.setattr(setup, "print_success", output_stub)
+    monkeypatch.setattr(setup, "prompt_yes_no", yes_stub)
 
-    async def fake_inspect(token: str, group_ref: str, user_refs: list[str]) -> VkSetupResult:
+    async def fake_inspect(
+        token: str,
+        group_ref: str,
+        user_refs: list[str],
+        *,
+        configure_community: bool = False,
+    ) -> VkSetupResult:
         assert token == "secret-token"  # noqa: S105 - inert test fixture value
         assert group_ref == "https://vk.com/club240186772"
         assert user_refs == ["https://vk.com/shkarupa.alex"]
+        assert configure_community is True
         return VkSetupResult(group_id=240186772, group_name="BatchIO", allowed_user_ids=[7750207])
 
     monkeypatch.setattr(setup, "inspect_vk_setup", fake_inspect)
