@@ -90,7 +90,10 @@ def _render_tokens(tokens: list[Token]) -> str:  # noqa: C901, PLR0912
         kind = token.type
         if kind == "inline":
             output.append(_render_inline(token.children or []))
-        elif kind in {"paragraph_close", "heading_close"}:
+        elif kind == "paragraph_close":
+            if not list_index:
+                output.append("\n\n")
+        elif kind == "heading_close":
             output.append("\n\n")
         elif kind == "bullet_list_open":
             list_index.append(0)

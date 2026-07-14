@@ -137,7 +137,13 @@ uv run pyright packages/hermes-vk-community
 hermes gateway restart
 ```
 
-Hermes передаёт адаптеру Markdown. Пока live-профиль возможностей форматирования
-VK не подтверждён, адаптер консервативно преобразует его в читаемый текст. Статус
-«печатает» отправляется через `messages.setActivity`, если
-`typing_indicator: true`.
+Hermes передаёт адаптеру Markdown. Live-тест API `5.199` от 15 июля 2026 года
+показал, что HTML-теги в `messages.send` отображаются буквально, а официальный
+контракт не содержит `format_data` или parse mode. Поэтому `auto` безопасно
+преобразует Markdown в читаемый текст: сохраняет списки и кликабельные bare URL,
+но не обещает жирный или курсив. Подробности записаны в
+[`docs/vk-rich-text-compatibility.md`](docs/vk-rich-text-compatibility.md).
+
+Статус «печатает» отправляется через `messages.setActivity`, если
+`typing_indicator: true`; live-тест подтвердил и ответ API, и отображение в
+клиенте VK.

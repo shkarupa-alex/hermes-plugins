@@ -18,6 +18,11 @@ def test_incoming_mentions_and_controls() -> None:
     assert sanitize_incoming_text("a\x00b") == "ab"
 
 
+def test_markdown_list_has_no_blank_lines_between_items() -> None:
+    rendered = PlainVkRenderer().render_markdown("- первый пункт\n- второй пункт")
+    assert rendered.text == "• первый пункт\n• второй пункт"
+
+
 def test_chunking_is_lossless_apart_from_boundary_whitespace() -> None:
     chunks = split_message("Первый абзац.\n\nВторой абзац длиннее.", 20)  # noqa: RUF001
     assert all(len(chunk) <= 20 for chunk in chunks)
