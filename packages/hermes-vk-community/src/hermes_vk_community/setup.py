@@ -8,7 +8,8 @@ from hermes_cli.setup import print_error, print_header, print_info, print_succes
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from hermes_vk_community.client import VkApiClient
-from hermes_vk_community.models import Group, GroupsResponse, User
+from hermes_vk_community.config import API_VERSION
+from hermes_vk_community.models import CommunityLongPollSettings, Group, GroupsResponse, User
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -103,6 +104,8 @@ async def inspect_vk_setup(token: str, group_ref: str, user_refs: list[str]) -> 
         if any(user_id not in visible_user_ids for user_id in allowed_user_ids):
             raise ValueError("one or more allowed VK users could not be resolved")
 
+        long_poll_payload = await client.call("groups.getLongPollSettings", {"group_id": group_id})
+        validate_long_poll_capabilities(CommunityLongPollSettings.model_validate(long_poll_payload))
         await client.get_long_poll_lease(group_id)
         return VkSetupResult(
             group_id=group_id,
@@ -111,6 +114,18 @@ async def inspect_vk_setup(token: str, group_ref: str, user_refs: list[str]) -> 
         )
     finally:
         await client.close()
+
+
+def validate_long_poll_capabilities(settings: CommunityLongPollSettings) -> None:
+    """Reject a superficially enabled Long Poll setup that cannot deliver messages."""
+    if not settings.is_enabled:
+        raise ValueError("Community Long Poll is disabled")
+    if settings.api_version != API_VERSION:
+        raise ValueError(
+            f"Community Long Poll API version must be {API_VERSION}, got {settings.api_version or 'unset'}",
+        )
+    if settings.events.message_new != 1:
+        raise ValueError("Community Long Poll event 'message_new' (incoming messages) is disabled")
 
 
 def interactive_setup() -> None:

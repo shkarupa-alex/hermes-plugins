@@ -4,11 +4,13 @@ from typing import Any
 import pytest
 
 from hermes_vk_community import setup
+from hermes_vk_community.models import CommunityLongPollSettings
 from hermes_vk_community.setup import (
     VkSetupResult,
     interactive_setup,
     numeric_id_from_reference,
     screen_name_from_reference,
+    validate_long_poll_capabilities,
 )
 
 
@@ -34,6 +36,27 @@ def test_numeric_id_understands_vk_canonical_prefixes() -> None:
     assert numeric_id_from_reference("https://vk.com/club240186772", prefixes=("club", "public", "event")) == 240186772
     assert numeric_id_from_reference("https://vk.com/id7750207", prefixes=("id",)) == 7750207
     assert numeric_id_from_reference("https://vk.com/shkarupa.alex", prefixes=("id",)) is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"is_enabled": False, "api_version": "5.199", "events": {"message_new": 1}}, "disabled"),
+        ({"is_enabled": True, "api_version": "5.131", "events": {"message_new": 1}}, "version"),
+        ({"is_enabled": True, "api_version": "5.199", "events": {"message_new": 0}}, "message_new"),
+    ],
+)
+def test_long_poll_validation_requires_incoming_message_events(payload: dict[str, object], error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        validate_long_poll_capabilities(CommunityLongPollSettings.model_validate(payload))
+
+
+def test_long_poll_validation_accepts_required_capabilities() -> None:
+    validate_long_poll_capabilities(
+        CommunityLongPollSettings.model_validate(
+            {"is_enabled": True, "api_version": "5.199", "events": {"message_new": 1}},
+        ),
+    )
 
 
 def test_write_setup_config_uses_non_secret_yaml_fields_only() -> None:

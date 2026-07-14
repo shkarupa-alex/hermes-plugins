@@ -34,6 +34,16 @@ class LongPollResponse(VkModel):
     failed: int | None = None
 
 
+class CommunityLongPollEvents(VkModel):
+    message_new: int = 0
+
+
+class CommunityLongPollSettings(VkModel):
+    is_enabled: bool = False
+    api_version: str = ""
+    events: CommunityLongPollEvents = Field(default_factory=CommunityLongPollEvents)
+
+
 class PhotoSize(VkModel):
     url: str
     width: int = 0
