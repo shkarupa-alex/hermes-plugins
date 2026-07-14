@@ -1,16 +1,24 @@
 from __future__ import annotations
 import asyncio
 import logging
-import secrets
 import time
 from pathlib import Path
 from typing import Any, Never
 
+import aiohttp
 from agent.secret_scope import get_secret
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, cache_media_bytes
 from hermes_constants import get_hermes_home
 from pydantic import TypeAdapter
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    stop_never,
+    wait_random_exponential,
+)
 
 from hermes_vk_community.client import VkApiClient
 from hermes_vk_community.config import PolicyEnvironment, VkSettings, settings_from_platform_config
@@ -28,6 +36,8 @@ from hermes_vk_community.renderer import PlainVkRenderer, split_message
 from hermes_vk_community.storage import InboxRecord, VkStorage
 
 logger = logging.getLogger(__name__)
+HTTP_TOO_MANY_REQUESTS = 429
+HTTP_SERVER_ERROR_MIN = 500
 
 
 class VkCommunityAdapter(BasePlatformAdapter):
@@ -115,8 +125,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         for chunk, record in zip(chunks, outbox, strict=True):
             await self._storage.mark_outbox(record.id, "sending")
             try:
-                response = await self._client.call(
-                    "messages.send",
+                response = await self._send_chunk(
                     {
                         "peer_id": int(chat_id),
                         "message": chunk,
@@ -245,37 +254,60 @@ class VkCommunityAdapter(BasePlatformAdapter):
             raise ValueError("VK token does not belong to the configured group_id")
 
     async def _poll_loop(self) -> None:
-        delay = self.settings.long_poll.retry_min_seconds
         while self._running:
             try:
-                client, lease, storage = self._polling_resources()
-                ts = await storage.cursor(self.settings.group_id) or lease.ts
-                response = await client.poll(
-                    lease,
-                    ts=ts,
-                    wait_seconds=self.settings.long_poll.wait_seconds,
+                retrying = AsyncRetrying(
+                    retry=retry_if_exception(_is_retryable_poll_error),
+                    wait=wait_random_exponential(
+                        multiplier=self.settings.long_poll.retry_min_seconds,
+                        max=self.settings.long_poll.retry_max_seconds,
+                    ),
+                    stop=stop_never,
+                    before_sleep=_log_poll_retry,
+                    reraise=True,
                 )
-                if response.failed == 1 and response.ts is not None:
-                    await storage.admit_batch(self.settings.group_id, [], response.ts)
-                elif response.failed == 2:  # noqa: PLR2004
-                    new_lease = await client.get_long_poll_lease(self.settings.group_id)
-                    self._lease = new_lease.model_copy(update={"ts": ts})
-                elif response.failed == 3:  # noqa: PLR2004
-                    self._lease = await client.get_long_poll_lease(self.settings.group_id)
-                    await storage.admit_batch(self.settings.group_id, [], self._lease.ts)
-                    logger.warning("[vk] Long Poll history gap reported for group %s", self.settings.group_id)
-                elif response.failed is not None:
-                    _raise_unsupported_failure(response.failed)
-                elif response.ts is not None:
-                    await storage.admit_batch(self.settings.group_id, response.updates, response.ts)
-                    await self._dispatch_received()
-                delay = self.settings.long_poll.retry_min_seconds
+                await retrying(self._poll_once)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[vk] Long Poll failed: %s", exc)
-                await asyncio.sleep(secrets.SystemRandom().uniform(0, delay))
-                delay = min(delay * 2, self.settings.long_poll.retry_max_seconds)
+            except Exception as exc:
+                self._running = False
+                self._set_fatal_error("vk_long_poll_terminal", f"VK Long Poll stopped: {exc}", retryable=False)
+                logger.exception("[vk] Long Poll stopped after a non-retryable failure")
+                await self._notify_fatal_error()
+
+    async def _poll_once(self) -> None:
+        client, lease, storage = self._polling_resources()
+        ts = await storage.cursor(self.settings.group_id) or lease.ts
+        response = await client.poll(
+            lease,
+            ts=ts,
+            wait_seconds=self.settings.long_poll.wait_seconds,
+        )
+        if response.failed == 1 and response.ts is not None:
+            await storage.admit_batch(self.settings.group_id, [], response.ts)
+        elif response.failed == 2:  # noqa: PLR2004 - VK protocol failure code
+            new_lease = await client.get_long_poll_lease(self.settings.group_id)
+            self._lease = new_lease.model_copy(update={"ts": ts})
+        elif response.failed == 3:  # noqa: PLR2004 - VK protocol failure code
+            self._lease = await client.get_long_poll_lease(self.settings.group_id)
+            await storage.admit_batch(self.settings.group_id, [], self._lease.ts)
+            logger.warning("[vk] Long Poll history gap reported for group %s", self.settings.group_id)
+        elif response.failed is not None:
+            _raise_unsupported_failure(response.failed)
+        elif response.ts is not None:
+            await storage.admit_batch(self.settings.group_id, response.updates, response.ts)
+            await self._dispatch_received()
+
+    async def _send_chunk(self, params: dict[str, object]) -> object:
+        if self._client is None:
+            raise RuntimeError("VK client is not connected")
+        retrying = AsyncRetrying(
+            retry=retry_if_exception(_is_retryable_send_error),
+            wait=wait_random_exponential(multiplier=1, max=5),
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        return await retrying(self._client.call, "messages.send", params)
 
     async def _dispatch_received(self) -> None:
         if self._storage is None:
@@ -457,3 +489,25 @@ def _raise_unsupported_failure(code: int) -> Never:
 
 def _raise_polling_resources_missing() -> Never:
     raise RuntimeError("VK polling resources are not initialized")
+
+
+def _is_retryable_send_error(exc: BaseException) -> bool:
+    return isinstance(exc, VkApiError) and exc.code in {6, 10}
+
+
+def _is_retryable_poll_error(exc: BaseException) -> bool:
+    if isinstance(exc, VkApiError):
+        return exc.code in {6, 10}
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status == HTTP_TOO_MANY_REQUESTS or exc.status >= HTTP_SERVER_ERROR_MIN
+    return isinstance(exc, (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ServerDisconnectedError, OSError))
+
+
+def _log_poll_retry(state: RetryCallState) -> None:
+    exception = state.outcome.exception() if state.outcome is not None else None
+    logger.warning(
+        "[vk] transient Long Poll failure; retry %s in %.2fs (%s)",
+        state.attempt_number,
+        state.next_action.sleep if state.next_action is not None else 0,
+        type(exception).__name__ if exception is not None else "unknown",
+    )

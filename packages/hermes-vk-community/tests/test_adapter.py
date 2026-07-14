@@ -6,7 +6,13 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
-from hermes_vk_community.adapter import VkCommunityAdapter, _attachment_candidate
+from hermes_vk_community.adapter import (
+    VkCommunityAdapter,
+    _attachment_candidate,
+    _is_retryable_poll_error,
+    _is_retryable_send_error,
+)
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError
 from hermes_vk_community.models import VkAttachment
 from hermes_vk_community.plugin import build_adapter
 from hermes_vk_community.storage import InboxRecord, VkStorage
@@ -93,3 +99,16 @@ def test_audio_message_prefers_ogg_and_marks_voice() -> None:
         "audio",
         True,
     )
+
+
+def test_retries_only_definitely_rejected_send_attempts() -> None:
+    assert _is_retryable_send_error(VkApiError(6, "too many requests"))
+    assert _is_retryable_send_error(VkApiError(10, "internal error"))
+    assert not _is_retryable_send_error(VkApiError(914, "message too long"))
+    assert not _is_retryable_send_error(VkDeliveryUnknownError("timed out"))
+
+
+def test_poll_retries_transport_errors_but_not_protocol_errors() -> None:
+    assert _is_retryable_poll_error(TimeoutError())
+    assert _is_retryable_poll_error(OSError())
+    assert not _is_retryable_poll_error(ValueError("invalid lease host"))
