@@ -1,0 +1,6 @@
+name: onnx-asr
+label: ONNX ASR
+kind: backend
+version: 0.1.0
+description: Offline CPU-only speech recognition for Hermes Agent using onnx-asr.
+author: Hermes ONNX ASR contributors

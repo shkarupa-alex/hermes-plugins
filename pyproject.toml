@@ -60,6 +60,7 @@ no-lines-before = ["standard-library"]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
+"**/cli.py" = ["T201"] # CLI commands intentionally write user-facing output.
 "**/tests/**/*.py" = [
     "PLC0415", # Local imports are useful for dependency and plugin-discovery tests.
     "PLR2004", # Literal protocol values keep contract tests readable.
@@ -69,6 +70,7 @@ convention = "google"
     "SLF001",  # Contract tests need to inspect adapter/provider internals.
 ]
 "integration-tests/**/*.py" = [
+    "INP001",
     "PLC0415",
     "PLR2004",
     "PLR0913",
@@ -102,6 +104,7 @@ reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 addopts = [
+    "--import-mode=importlib",
     "--strict-config",
     "--strict-markers",
 ]

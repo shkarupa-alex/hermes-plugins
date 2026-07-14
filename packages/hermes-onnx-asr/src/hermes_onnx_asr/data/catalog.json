@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "onnx_asr_version": "0.11.0",
+  "models": [
+    {"alias":"gigaam-v2-ctc","repository":"istupakov/gigaam-v2-onnx","revision":"272ca4baa32450a3edad2b775e4421ad8d7c6590","quantizations":["int8",null]},
+    {"alias":"gigaam-v2-rnnt","repository":"istupakov/gigaam-v2-onnx","revision":"272ca4baa32450a3edad2b775e4421ad8d7c6590","quantizations":["int8",null]},
+    {"alias":"gigaam-v3-ctc","repository":"istupakov/gigaam-v3-onnx","revision":"322c3b29492673eb7d0b434bfa9dfb8653e34d02","quantizations":["int8",null]},
+    {"alias":"gigaam-v3-rnnt","repository":"istupakov/gigaam-v3-onnx","revision":"322c3b29492673eb7d0b434bfa9dfb8653e34d02","quantizations":["int8",null]},
+    {"alias":"gigaam-v3-e2e-ctc","repository":"istupakov/gigaam-v3-onnx","revision":"322c3b29492673eb7d0b434bfa9dfb8653e34d02","quantizations":["int8",null]},
+    {"alias":"gigaam-v3-e2e-rnnt","repository":"istupakov/gigaam-v3-onnx","revision":"322c3b29492673eb7d0b434bfa9dfb8653e34d02","quantizations":["int8",null]},
+    {"alias":"nemo-fastconformer-ru-ctc","repository":"istupakov/stt_ru_fastconformer_hybrid_large_pc_onnx","revision":"fb6753736c56de3259d78a26a488548c84b9dccb","quantizations":["int8",null]},
+    {"alias":"nemo-fastconformer-ru-rnnt","repository":"istupakov/stt_ru_fastconformer_hybrid_large_pc_onnx","revision":"fb6753736c56de3259d78a26a488548c84b9dccb","quantizations":["int8",null]}
+  ],
+  "vads": [
+    {"alias":"silero","repository":"istupakov/silero-vad-onnx","revision":"b3e3ee3cce4c11ceb63b1a0b229d916069c1ddf6","quantizations":[null]}
+  ]
+}

@@ -1,0 +1,239 @@
+from __future__ import annotations
+import hashlib
+import json
+import os
+import shutil
+import stat
+import time
+import uuid
+from datetime import UTC, datetime
+from importlib.metadata import version
+from importlib.resources import files
+from pathlib import Path
+from typing import Literal
+
+from filelock import FileLock
+from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
+from onnx_asr.loader import create_asr_resolver, create_vad_resolver
+from pydantic import BaseModel, ConfigDict
+
+from hermes_onnx_asr.errors import OnnxAsrError, safe_error
+
+MANIFEST_SCHEMA_VERSION = 1
+
+
+class CatalogEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str
+    repository: str
+    revision: str
+    quantizations: list[str | None]
+
+
+class Catalog(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int
+    onnx_asr_version: str
+    models: list[CatalogEntry]
+    vads: list[CatalogEntry]
+
+
+class ManifestFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size: int
+    sha256: str
+
+
+class BundleManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int
+    kind: Literal["model", "vad"]
+    alias: str
+    quantization: str | None
+    repository: str
+    revision: str
+    onnx_asr_version: str
+    created_at: datetime
+    files: list[ManifestFile]
+    manifest_sha256: str
+
+
+def load_catalog() -> Catalog:
+    resource = files("hermes_onnx_asr").joinpath("data/catalog.json")
+    return Catalog.model_validate_json(resource.read_text(encoding="utf-8"))
+
+
+def catalog_entry(alias: str, quantization: str | None, *, kind: Literal["model", "vad"] = "model") -> CatalogEntry:
+    catalog = load_catalog()
+    entries = catalog.models if kind == "model" else catalog.vads
+    for entry in entries:
+        if entry.alias == alias and quantization in entry.quantizations:
+            return entry
+    raise safe_error("model_not_in_catalog" if kind == "model" else "vad_not_installed")
+
+
+def bundle_path(root: Path, alias: str, quantization: str | None, *, kind: Literal["model", "vad"] = "model") -> Path:
+    suffix = quantization or "fp32"
+    return root / ("models" if kind == "model" else "vad") / alias / suffix
+
+
+def _expected_patterns(alias: str, quantization: str | None, kind: Literal["model", "vad"]) -> list[str]:
+    resolver = create_asr_resolver(alias) if kind == "model" else create_vad_resolver(alias)
+    patterns = list(resolver.model_type._get_model_files(quantization).values())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    return [
+        "config.json",
+        "config.yaml",
+        *patterns,
+        *(str(Path(pattern).with_suffix(".onnx?data")) for pattern in patterns if Path(pattern).suffix == ".onnx"),
+    ]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _canonical_manifest_hash(data: dict[str, object]) -> str:
+    unsigned = {key: value for key, value in data.items() if key != "manifest_sha256"}
+    payload = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _inventory(directory: Path) -> list[ManifestFile]:
+    result: list[ManifestFile] = []
+    for path in sorted(directory.rglob("*")):
+        if path.name == "manifest.json" or path.is_dir():
+            continue
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise OnnxAsrError("model_load_failed", "Downloaded bundle contains an unsupported file type.")
+        relative = path.relative_to(directory).as_posix()
+        result.append(ManifestFile(path=relative, size=path.stat().st_size, sha256=_sha256(path)))
+    return result
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_fd)
+
+
+def _write_manifest(
+    directory: Path,
+    entry: CatalogEntry,
+    quantization: str | None,
+    kind: Literal["model", "vad"],
+) -> BundleManifest:
+    draft = BundleManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        kind=kind,
+        alias=entry.alias,
+        quantization=quantization,
+        repository=entry.repository,
+        revision=entry.revision,
+        onnx_asr_version=version("onnx-asr"),
+        created_at=datetime.now(UTC),
+        files=_inventory(directory),
+        manifest_sha256="",
+    )
+    manifest = draft.model_copy(update={"manifest_sha256": _canonical_manifest_hash(draft.model_dump(mode="json"))})
+    manifest_path = directory / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    with manifest_path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    return manifest
+
+
+def verify_bundle(
+    directory: Path,
+    alias: str,
+    quantization: str | None,
+    *,
+    kind: Literal["model", "vad"] = "model",
+) -> BundleManifest:
+    entry = catalog_entry(alias, quantization, kind=kind)
+    manifest_path = directory / "manifest.json"
+    try:
+        manifest = BundleManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed") from exc
+    raw = manifest.model_dump(mode="json")
+    if manifest.manifest_sha256 != _canonical_manifest_hash(raw):
+        raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
+    identity = (manifest.kind, manifest.alias, manifest.quantization, manifest.repository, manifest.revision)
+    expected = (kind, alias, quantization, entry.repository, entry.revision)
+    if identity != expected or manifest.onnx_asr_version != load_catalog().onnx_asr_version:
+        raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
+    actual = _inventory(directory)
+    if actual != manifest.files:
+        raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
+    for pattern in _expected_patterns(alias, quantization, kind):
+        if pattern in {"config.json", "config.yaml"} or ".onnx?data" in pattern:
+            continue
+        matches = list(directory.glob(pattern))
+        if not matches and not pattern.endswith(".data"):
+            raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
+    return manifest
+
+
+def fetch_bundle(
+    root: Path,
+    alias: str,
+    quantization: str | None,
+    *,
+    kind: Literal["model", "vad"] = "model",
+) -> Path:
+    entry = catalog_entry(alias, quantization, kind=kind)
+    destination = bundle_path(root, alias, quantization, kind=kind)
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = FileLock(str(destination) + ".lock")
+    with lock:
+        if destination.exists():
+            try:
+                verify_bundle(destination, alias, quantization, kind=kind)
+            except OnnxAsrError:
+                quarantine = destination.with_name(
+                    f"{destination.name}.invalid-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+                )
+                destination.rename(quarantine)
+            else:
+                return destination
+        staging = destination.with_name(f".{destination.name}.staging-{uuid.uuid4().hex}")
+        staging.mkdir(mode=0o700)
+        try:
+            snapshot_download(
+                repo_id=entry.repository,
+                revision=entry.revision,
+                local_dir=staging,
+                allow_patterns=_expected_patterns(alias, quantization, kind),
+            )
+            shutil.rmtree(staging / ".cache", ignore_errors=True)
+            _write_manifest(staging, entry, quantization, kind)
+            verify_bundle(staging, alias, quantization, kind=kind)
+            _fsync_directory(staging)
+            staging.rename(destination)
+            _fsync_directory(destination.parent)
+        except Exception as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            if isinstance(exc, OnnxAsrError):
+                raise
+            raise safe_error("model_load_failed") from exc
+    return destination
