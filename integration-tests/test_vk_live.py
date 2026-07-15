@@ -65,11 +65,7 @@ def _mapping(value: object) -> dict[str, object] | None:
     return cast("dict[str, object]", value) if isinstance(value, dict) else None
 
 
-def _dimension(value: object) -> int:
-    return value if isinstance(value, int) else 0
-
-
-def _latest_incoming_with_photo(history: object, peer_id: int) -> tuple[int, str]:  # noqa: C901
+def _latest_incoming_message_id(history: object, peer_id: int) -> int:
     if not isinstance(history, dict):
         raise TypeError("messages.getHistory returned no object")
     items = cast("dict[str, object]", history).get("items")
@@ -79,33 +75,34 @@ def _latest_incoming_with_photo(history: object, peer_id: int) -> tuple[int, str
         if not isinstance(raw_message, dict):
             continue
         message = cast("dict[str, object]", raw_message)
-        if message.get("from_id") != peer_id or not isinstance(message.get("id"), int):
+        message_id = message.get("id")
+        if message.get("from_id") == peer_id and isinstance(message_id, int):
+            return message_id
+    raise AssertionError("no recent incoming VK message was found for the test peer")
+
+
+def _photo_url(message: dict[str, object]) -> str:
+    attachments = message.get("attachments")
+    if not isinstance(attachments, list):
+        raise TypeError("VK message contains no attachment list")
+    for raw_attachment in cast("list[object]", attachments):
+        attachment = _mapping(raw_attachment)
+        if attachment is None or attachment.get("type") != "photo":
             continue
-        attachments = message.get("attachments")
-        if not isinstance(attachments, list):
+        photo = _mapping(attachment.get("photo"))
+        if photo is None:
             continue
-        for raw_attachment in cast("list[object]", attachments):
-            attachment = _mapping(raw_attachment)
-            if attachment is None or attachment.get("type") != "photo":
-                continue
-            photo = _mapping(attachment.get("photo"))
-            if photo is None:
-                continue
-            sizes = photo.get("sizes")
-            if not isinstance(sizes, list):
-                continue
-            candidates = [
-                mapped
-                for size in cast("list[object]", sizes)
-                if (mapped := _mapping(size)) is not None and isinstance(mapped.get("url"), str)
-            ]
-            if candidates:
-                largest = max(
-                    candidates,
-                    key=lambda size: _dimension(size.get("width")) * _dimension(size.get("height")),
-                )
-                return cast("int", message["id"]), cast("str", largest["url"])
-    raise AssertionError("no recent incoming VK photo was found for the test peer")
+        sizes = photo.get("sizes")
+        if not isinstance(sizes, list):
+            continue
+        urls = [
+            cast("str", size["url"])
+            for raw_size in cast("list[object]", sizes)
+            if (size := _mapping(raw_size)) is not None and isinstance(size.get("url"), str)
+        ]
+        if urls:
+            return urls[-1]
+    raise AssertionError("VK message contains no downloadable photo")
 
 
 @pytest.mark.vk_live
@@ -148,20 +145,15 @@ async def test_vk_live_text_typing_edit_and_long_poll() -> None:
 
 @pytest.mark.vk_live
 @pytest.mark.asyncio
-async def test_vk_live_dm_reply_download_formatting_and_buttons() -> None:
+async def test_vk_live_dm_reply_formatting_and_buttons() -> None:
     token, _group_id, peer_id = _credentials()
     client = VkApiClient(token)
     sent_id: int | None = None
-    downloaded = None
     try:
-        incoming_id, photo_url = _latest_incoming_with_photo(
-            await client.call("messages.getHistory", {"peer_id": peer_id, "count": 20}),
+        incoming_id = _latest_incoming_message_id(
+            await client.call("messages.getHistory", {"peer_id": peer_id, "count": 100}),
             peer_id,
         )
-        downloaded = await client.download_media(photo_url)
-        assert downloaded.path.is_file()
-        assert downloaded.path.stat().st_size > 0
-
         message = "😀 Жирный live test"
         format_data = {
             "version": 1,
@@ -203,8 +195,6 @@ async def test_vk_live_dm_reply_download_formatting_and_buttons() -> None:
         reply = TypeAdapter(dict[str, object]).validate_python(items[0].get("reply_message"))
         assert reply["id"] == incoming_id
     finally:
-        if downloaded is not None:
-            downloaded.cleanup()
         if sent_id is not None:
             await client.call(
                 "messages.delete",
@@ -270,11 +260,21 @@ async def test_vk_live_photo_upload_and_visible_delivery(tmp_path: Path) -> None
     image = tmp_path / "release-test.png"
     image.write_bytes(PNG_1X1)
     result = None
+    downloaded = None
     try:
         result = await adapter.send_image_file(peer_id.__str__(), str(image), "Hermes VK photo release test")
         assert result.success
         assert result.message_id
+        readback = TypeAdapter(dict[str, object]).validate_python(
+            await client.call("messages.getById", {"message_ids": int(result.message_id)})
+        )
+        items = TypeAdapter(list[dict[str, object]]).validate_python(readback.get("items"))
+        downloaded = await client.download_media(_photo_url(items[0]))
+        assert downloaded.path.is_file()
+        assert downloaded.path.stat().st_size > 0
     finally:
+        if downloaded is not None:
+            downloaded.cleanup()
         if result is not None and result.message_id:
             await adapter.delete_message(str(peer_id), result.message_id)
         await client.close()
