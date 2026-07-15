@@ -13,7 +13,7 @@ from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
 from pydantic import ValidationError
 
-from hermes_onnx_asr.catalog import bundle_path, fetch_bundle, load_catalog, verify_bundle
+from hermes_onnx_asr.catalog import bundle_path, fetch_bundle, model_entry, upstream_model_names, verify_bundle
 from hermes_onnx_asr.compat import check_compatibility, check_requirements
 from hermes_onnx_asr.config import load_settings
 from hermes_onnx_asr.errors import OnnxAsrError
@@ -85,11 +85,11 @@ def handle_command(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911 - ar
 
 
 def _list_models() -> int:
-    catalog = load_catalog()
-    for entry in catalog.models:
-        marker = " (default)" if entry.alias == "gigaam-v3-e2e-rnnt" else ""
+    for alias in upstream_model_names():
+        entry = model_entry(alias)
+        marker = " (default)" if alias == "gigaam-v3-e2e-rnnt" else ""
         quantizations = ", ".join(value or "fp32" for value in entry.quantizations)
-        print(f"{entry.alias}{marker}: {quantizations}")
+        print(f"{alias}{marker}: {quantizations}")
     return 0
 
 

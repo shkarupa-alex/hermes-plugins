@@ -61,15 +61,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model:
-          - gigaam-v2-ctc
-          - gigaam-v2-rnnt
-          - gigaam-v3-ctc
-          - gigaam-v3-rnnt
-          - gigaam-v3-e2e-ctc
-          - gigaam-v3-e2e-rnnt
-          - nemo-fastconformer-ru-ctc
-          - nemo-fastconformer-ru-rnnt
+        include:
+          - {model: gigaam-v2-ctc, quantization: int8}
+          - {model: gigaam-v2-rnnt, quantization: int8}
+          - {model: gigaam-v3-ctc, quantization: int8}
+          - {model: gigaam-v3-rnnt, quantization: int8}
+          - {model: gigaam-v3-e2e-ctc, quantization: int8}
+          - {model: gigaam-v3-e2e-rnnt, quantization: int8}
+          - {model: gigaam-multilingual-ctc, quantization: int8}
+          - {model: gigaam-multilingual-large-ctc, quantization: int8}
+          - {model: nemo-fastconformer-ru-ctc, quantization: int8}
+          - {model: nemo-fastconformer-ru-rnnt, quantization: int8}
+          - {model: nemo-parakeet-ctc-0.6b, quantization: int8}
+          - {model: nemo-parakeet-rnnt-0.6b, quantization: int8}
+          - {model: nemo-parakeet-tdt-0.6b-v2, quantization: int8}
+          - {model: nemo-parakeet-tdt-0.6b-v3, quantization: int8}
+          - {model: nemo-canary-1b-v2, quantization: int8}
+          - {model: alphacep/vosk-model-ru, quantization: int8}
+          - {model: alphacep/vosk-model-small-ru, quantization: int8}
+          - {model: t-tech/t-one, quantization: fp32}
+          - {model: whisper-base, quantization: int8}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,9 +89,11 @@ jobs:
       - name: Configure model profile
         run: |
           mkdir -p "$RUNNER_TEMP/hermes-profile"
-          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: ${{ matrix.model }}\n    quantization: int8\n    vad:\n      min_audio_seconds: null\n' > "$RUNNER_TEMP/hermes-profile/config.yaml"
+          config_quantization="${{ matrix.quantization }}"
+          if [ "$config_quantization" = fp32 ]; then config_quantization=null; fi
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: ${{ matrix.model }}\n    quantization: %s\n    model_dir: "%s/models/onnx-asr"\n    vad:\n      min_audio_seconds: null\n' "$config_quantization" "$RUNNER_TEMP/hermes-profile" > "$RUNNER_TEMP/hermes-profile/config.yaml"
           echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "${{ matrix.model }}" --quantization int8
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "${{ matrix.model }}" --quantization "${{ matrix.quantization }}"
       - run: uv run --package hermes-onnx-asr hermes onnx-asr warmup
 
   vk-live:

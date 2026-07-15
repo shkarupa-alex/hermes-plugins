@@ -5,9 +5,17 @@ from typing import Any
 
 import pytest
 
+from hermes_onnx_asr.catalog import upstream_model_names
 from hermes_onnx_asr.config import OnnxAsrSettings
 from hermes_onnx_asr.errors import OnnxAsrError
-from hermes_onnx_asr.pipeline import CPU_PROVIDERS, RESAMPLER_RATES, audit_cpu_sessions, load_pipeline, recognize
+from hermes_onnx_asr.pipeline import (
+    CPU_PROVIDERS,
+    MODEL_SESSION_ROLES,
+    RESAMPLER_RATES,
+    audit_cpu_sessions,
+    load_pipeline,
+    recognize,
+)
 
 
 class FakeSession:
@@ -44,6 +52,10 @@ class VadModel:
     def recognize(self, _path: Path, *, channel: str, **_kwargs: object) -> list[SimpleNamespace]:
         assert channel == "mean"
         return [SimpleNamespace(text=text) for text in self.texts]
+
+
+def test_every_upstream_model_has_an_exact_cpu_session_manifest() -> None:
+    assert set(MODEL_SESSION_ROLES) == set(upstream_model_names())
 
 
 def test_cpu_audit_rejects_non_cpu_session() -> None:

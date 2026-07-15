@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 def fake_catalog() -> Catalog:
     return Catalog(
         schema_version=1,
-        onnx_asr_version="0.11.0",
+        onnx_asr_version="0.12.0",
         models=[
             CatalogEntry(
                 alias="test-model",
@@ -53,7 +53,8 @@ def test_manifest_round_trip_and_tamper_detection(monkeypatch: pytest.MonkeyPatc
 
 def test_catalog_contains_only_immutable_revisions() -> None:
     loaded = catalog.load_catalog()
-    assert loaded.onnx_asr_version == "0.11.0"
+    assert loaded.onnx_asr_version == "0.12.0"
+    assert tuple(entry.alias for entry in loaded.models) == catalog.upstream_model_names()
     assert {entry.alias for entry in loaded.models} >= {
         "gigaam-v3-e2e-rnnt",
         "nemo-fastconformer-ru-rnnt",

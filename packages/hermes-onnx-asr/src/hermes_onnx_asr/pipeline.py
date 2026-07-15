@@ -27,8 +27,19 @@ MODEL_SESSION_ROLES = {
     "gigaam-v3-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
     "gigaam-v3-e2e-ctc": frozenset({"asr.model"}),
     "gigaam-v3-e2e-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
+    "gigaam-multilingual-ctc": frozenset({"asr.model"}),
+    "gigaam-multilingual-large-ctc": frozenset({"asr.model"}),
     "nemo-fastconformer-ru-ctc": frozenset({"asr.model"}),
     "nemo-fastconformer-ru-rnnt": frozenset({"asr.encoder", "asr.decoder_joint"}),
+    "nemo-parakeet-ctc-0.6b": frozenset({"asr.model"}),
+    "nemo-parakeet-rnnt-0.6b": frozenset({"asr.encoder", "asr.decoder_joint"}),
+    "nemo-parakeet-tdt-0.6b-v2": frozenset({"asr.encoder", "asr.decoder_joint"}),
+    "nemo-parakeet-tdt-0.6b-v3": frozenset({"asr.encoder", "asr.decoder_joint"}),
+    "nemo-canary-1b-v2": frozenset({"asr.encoder", "asr.decoder"}),
+    "alphacep/vosk-model-ru": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
+    "alphacep/vosk-model-small-ru": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
+    "t-tech/t-one": frozenset({"asr.model"}),
+    "whisper-base": frozenset({"asr.model"}),
 }
 
 

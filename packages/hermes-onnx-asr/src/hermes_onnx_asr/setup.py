@@ -4,7 +4,7 @@ from typing import Any, cast
 from hermes_cli.config import read_raw_config, save_config
 from hermes_cli.setup import print_header, print_info, print_success, prompt, prompt_yes_no
 
-from hermes_onnx_asr.catalog import fetch_bundle, load_catalog
+from hermes_onnx_asr.catalog import fetch_bundle, model_entry, upstream_model_names
 from hermes_onnx_asr.config import DEFAULT_MODEL, OnnxAsrSettings, VadSettings
 
 
@@ -17,37 +17,72 @@ def _mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return result
 
 
-def write_setup_config(model: str, vad_seconds: float | None) -> None:
+def write_setup_config(model: str, quantization: str | None, vad_seconds: float | None) -> None:
     config = read_raw_config()
     stt = _mapping(config, "stt")
     stt["provider"] = "onnx_asr"
     onnx_config = _mapping(stt, "onnx_asr")
     onnx_config["model"] = model
-    onnx_config["quantization"] = "int8"
+    onnx_config["quantization"] = quantization
     vad_config = _mapping(onnx_config, "vad")
     vad_config["min_audio_seconds"] = vad_seconds
     save_config(config, strip_defaults=False)
 
 
+def _select_model() -> str:
+    aliases = upstream_model_names()
+    print_info("Модели, объявленные установленной версией onnx-asr:")
+    for index, alias in enumerate(aliases, start=1):
+        quantizations = ", ".join(value or "fp32" for value in model_entry(alias).quantizations)
+        marker = " (по умолчанию)" if alias == DEFAULT_MODEL else ""
+        print_info(f"  {index:>2}. {alias} [{quantizations}]{marker}")
+    default_choice = str(aliases.index(DEFAULT_MODEL) + 1)
+    raw_model = prompt("Модель — номер или точное имя", default=default_choice).strip()
+    if raw_model.isdigit() and 1 <= int(raw_model) <= len(aliases):
+        return aliases[int(raw_model) - 1]
+    if raw_model in aliases:
+        return raw_model
+    raise ValueError(f"Неподдерживаемая модель: {raw_model}")
+
+
+def _select_quantization(model: str) -> str | None:
+    supported_quantizations = model_entry(model).quantizations
+    if len(supported_quantizations) > 1:
+        raw_quantization = prompt("Квантование (int8 или fp32)", default="int8").strip().lower()
+        quantization = None if raw_quantization in {"fp32", "none"} else raw_quantization
+        if quantization not in supported_quantizations:
+            raise ValueError(f"Неподдерживаемое квантование для {model}: {raw_quantization}")
+        return quantization
+    only = supported_quantizations[0]
+    print_info(f"Для {model} доступно только {only or 'fp32'}.")
+    return only
+
+
+def _select_vad_threshold() -> float | None:
+    threshold = prompt("Silero VAD от N секунд (off — отключить)", default="20").strip().lower()
+    if threshold in {"off", "none", "null"}:
+        return None
+    try:
+        vad_seconds = float(threshold)
+    except ValueError as exc:
+        raise ValueError("Порог VAD должен быть неотрицательным числом или off") from exc
+    if vad_seconds < 0:
+        raise ValueError("Порог VAD должен быть неотрицательным числом")
+    return vad_seconds
+
+
 def interactive_setup() -> None:
     print_header("ONNX ASR — локальное распознавание речи")
     print_info("Модели работают только через CPUExecutionProvider. Секреты и API-ключи не нужны.")
-    aliases = {entry.alias for entry in load_catalog().models}
-    model = prompt("Модель", default=DEFAULT_MODEL).strip()
-    if model not in aliases:
-        raise ValueError(f"Неподдерживаемая модель: {model}")
-    threshold = prompt("Silero VAD от N секунд (off — отключить)", default="20").strip().lower()
-    if threshold in {"off", "none", "null"}:
-        vad_seconds = None
-    else:
-        try:
-            vad_seconds = float(threshold)
-        except ValueError as exc:
-            raise ValueError("Порог VAD должен быть неотрицательным числом или off") from exc
-        if vad_seconds < 0:
-            raise ValueError("Порог VAD должен быть неотрицательным числом")
-    write_setup_config(model, vad_seconds)
-    settings = OnnxAsrSettings(model=model, vad=VadSettings(min_audio_seconds=vad_seconds))
+    model = _select_model()
+    quantization = _select_quantization(model)
+    vad_seconds = _select_vad_threshold()
+    write_setup_config(model, quantization, vad_seconds)
+    settings = OnnxAsrSettings(
+        model=model,
+        quantization=quantization,
+        vad=VadSettings(min_audio_seconds=vad_seconds),
+    )
     if prompt_yes_no("Скачать модель и Silero VAD сейчас?", default=True):
         print_info("Скачивание может занять несколько минут и несколько гигабайт.")
         fetch_bundle(settings.model_dir, model, settings.quantization)

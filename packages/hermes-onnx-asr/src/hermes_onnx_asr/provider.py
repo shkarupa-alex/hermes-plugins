@@ -22,10 +22,28 @@ from hermes_onnx_asr.audio import (
     validate_source,
     wav_duration,
 )
-from hermes_onnx_asr.catalog import load_catalog
+from hermes_onnx_asr.catalog import upstream_model_names
 from hermes_onnx_asr.config import DEFAULT_MODEL, OnnxAsrSettings, load_settings
 from hermes_onnx_asr.errors import OnnxAsrError, safe_error
 from hermes_onnx_asr.pipeline import Pipeline, load_pipeline, recognize
+
+
+def _model_languages(alias: str) -> list[str]:
+    if alias in {
+        "gigaam-multilingual-ctc",
+        "gigaam-multilingual-large-ctc",
+        "nemo-parakeet-tdt-0.6b-v3",
+        "nemo-canary-1b-v2",
+        "whisper-base",
+    }:
+        return ["multilingual"]
+    if alias in {
+        "nemo-parakeet-ctc-0.6b",
+        "nemo-parakeet-rnnt-0.6b",
+        "nemo-parakeet-tdt-0.6b-v2",
+    }:
+        return ["en"]
+    return ["ru"]
 
 
 @dataclass
@@ -194,7 +212,9 @@ class OnnxAsrProvider(TranscriptionProvider):
         return DEFAULT_MODEL
 
     def list_models(self) -> list[dict[str, Any]]:
-        return [{"id": entry.alias, "display": entry.alias, "languages": ["ru"]} for entry in load_catalog().models]
+        return [
+            {"id": alias, "display": alias, "languages": _model_languages(alias)} for alias in upstream_model_names()
+        ]
 
     def get_setup_schema(self) -> dict[str, Any]:
         return {

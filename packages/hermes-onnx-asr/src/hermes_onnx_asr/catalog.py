@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from filelock import FileLock
 from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
@@ -74,7 +74,31 @@ class BundleManifest(BaseModel):
 
 def load_catalog() -> Catalog:
     resource = files("hermes_onnx_asr").joinpath("data/catalog.json")
-    return Catalog.model_validate_json(resource.read_text(encoding="utf-8"))
+    catalog = Catalog.model_validate_json(resource.read_text(encoding="utf-8"))
+    upstream = set(upstream_model_names())
+    bundled = {entry.alias for entry in catalog.models}
+    if bundled != upstream:
+        missing = ", ".join(sorted(upstream - bundled)) or "none"
+        stale = ", ".join(sorted(bundled - upstream)) or "none"
+        raise RuntimeError(f"ONNX ASR catalog mismatch; missing: {missing}; stale: {stale}")
+    return catalog
+
+
+def upstream_model_names() -> tuple[str, ...]:
+    """Use the same typed model registry as the upstream onnx-asr CLI."""
+    from onnx_asr.loader import AsrNames  # noqa: PLC0415
+
+    names = get_args(AsrNames)
+    if not names or not all(isinstance(name, str) and name for name in names):
+        raise RuntimeError("onnx-asr exposed an invalid model registry")
+    return names
+
+
+def model_entry(alias: str) -> CatalogEntry:
+    for entry in load_catalog().models:
+        if entry.alias == alias:
+            return entry
+    raise safe_error("model_not_in_catalog")
 
 
 def catalog_entry(alias: str, quantization: str | None, *, kind: Literal["model", "vad"] = "model") -> CatalogEntry:

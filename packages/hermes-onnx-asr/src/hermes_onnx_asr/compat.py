@@ -51,6 +51,6 @@ def check_requirements() -> bool:
     if not compatible:
         return False
     try:
-        return version("onnx-asr") == "0.11.0" and version("onnxruntime") == "1.23.2"
+        return version("onnx-asr") == "0.12.0" and version("onnxruntime") == "1.23.2"
     except PackageNotFoundError:
         return False
