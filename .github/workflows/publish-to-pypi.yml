@@ -25,6 +25,8 @@ concurrency:
 jobs:
   release-gates:
     uses: ./.github/workflows/release-gates.yml
+    with:
+      release_tag: ${{ inputs.release_tag || github.ref_name }}
     secrets: inherit
 
   release-build:
@@ -44,25 +46,7 @@ jobs:
       - name: Verify tag matches every package version
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-        run: |
-          python - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
-
-          expected = os.environ["RELEASE_TAG"].removeprefix("v")
-          package_files = sorted(Path("packages").glob("*/pyproject.toml"))
-          versions = {
-              tomllib.loads(path.read_text(encoding="utf-8"))["project"]["name"]:
-              tomllib.loads(path.read_text(encoding="utf-8"))["project"]["version"]
-              for path in package_files
-          }
-          mismatches = {name: version for name, version in versions.items() if version != expected}
-          if mismatches:
-              details = ", ".join(f"{name}={version}" for name, version in sorted(mismatches.items()))
-              raise SystemExit(f"tag {os.environ['RELEASE_TAG']} does not match package versions: {details}")
-          print(f"release version {expected}: {', '.join(sorted(versions))}")
-          PY
+        run: python tools/check_versions.py --tag "$RELEASE_TAG"
 
       - name: Build release distributions
         run: uv build --all-packages --out-dir dist --clear

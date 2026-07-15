@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-onnx-asr"
-version = "1.0.3"
+dynamic = ["version"]
 description = "CPU-only ONNX ASR transcription provider for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -20,6 +20,10 @@ dependencies = [
     "pydantic>=2.10.0,<3",
     "pydantic-settings>=2.7.0,<3",
 ]
+
+[tool.hatch.version]
+path = "plugin.yaml"
+pattern = '^version:\s*(?P<version>[^\s]+)\s*$'
 
 [project.entry-points."hermes_agent.plugins"]
 "onnx-asr" = "hermes_onnx_asr"

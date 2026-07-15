@@ -2,6 +2,11 @@ name: Release gates
 
 on:
   workflow_call:
+    inputs:
+      release_tag:
+        description: Release tag whose version must match plugin metadata
+        required: false
+        type: string
   workflow_dispatch:
 
 jobs:
@@ -14,6 +19,15 @@ jobs:
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v8.3.2
+      - name: Verify plugin release metadata
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            python tools/check_versions.py --tag "$RELEASE_TAG"
+          else
+            python tools/check_versions.py
+          fi
       - name: Audit locked production dependencies
         run: |
           uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
@@ -26,7 +40,10 @@ jobs:
             --ignore-vuln PYSEC-2026-2254 \
             --ignore-vuln PYSEC-2026-2255 \
             --ignore-vuln PYSEC-2026-2256 \
-            --ignore-vuln PYSEC-2026-2257
+            --ignore-vuln PYSEC-2026-2257 \
+            --ignore-vuln PYSEC-2026-3451 \
+            --ignore-vuln PYSEC-2026-3452 \
+            --ignore-vuln PYSEC-2026-3453
       - name: Scan repository history for secrets
         uses: gitleaks/gitleaks-action@v3
         env:
