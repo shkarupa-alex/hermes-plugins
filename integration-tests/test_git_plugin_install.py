@@ -35,7 +35,7 @@ def _load_directory_plugin(directory_name: str) -> ModuleType:
 
 
 @pytest.mark.parametrize(("directory_name", "package_name"), PLUGIN_CASES)
-def test_git_subdirectory_exports_register_and_keeps_manifest_version_current(
+def test_git_subdirectory_exports_register_and_sources_version_from_manifest(
     directory_name: str,
     package_name: str,
 ) -> None:
@@ -45,12 +45,9 @@ def test_git_subdirectory_exports_register_and_keeps_manifest_version_current(
     assert module.register.__module__.startswith(package_name)
 
     project = tomllib.loads((plugin_dir / "pyproject.toml").read_text(encoding="utf-8"))
-    manifest_version = next(
-        line.removeprefix("version:").strip()
-        for line in (plugin_dir / "plugin.yaml").read_text(encoding="utf-8").splitlines()
-        if line.startswith("version:")
-    )
-    assert manifest_version == project["project"]["version"]
+    assert project["project"]["dynamic"] == ["version"]
+    assert "version" not in project["project"]
+    assert project["tool"]["hatch"]["version"]["path"] == "plugin.yaml"
 
 
 @pytest.mark.parametrize(("directory_name", "_package_name"), PLUGIN_CASES)

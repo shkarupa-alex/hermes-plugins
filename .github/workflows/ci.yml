@@ -45,6 +45,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-packages --locked
+      - run: uv run python tools/check_versions.py
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run pyright
