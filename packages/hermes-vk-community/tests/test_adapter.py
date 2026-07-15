@@ -226,10 +226,56 @@ async def test_mixed_attachments_expose_only_voice_to_stt(monkeypatch: pytest.Mo
         ),
         VkAttachment.model_validate({"type": "photo", "photo": {"sizes": [{"url": "https://cdn.userapi.com/a.jpg"}]}}),
     ]
-    paths, media_types, is_voice, _text = await adapter._cache_attachments(attachments)
+    paths, media_types, is_voice, text = await adapter._cache_attachments(attachments)
     assert is_voice
     assert paths == [str(tmp_path / "media-1")]
     assert media_types == ["audio/ogg"]
+    assert text == "[cached]"
+
+
+@pytest.mark.asyncio
+async def test_voice_attachment_reaches_stt_without_cached_file_note(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+
+    class DownloadClient:
+        async def download_media(self, _url: str) -> SimpleNamespace:
+            path = tmp_path / "voice.ogg"
+            path.write_bytes(b"voice")
+            return SimpleNamespace(
+                path=path,
+                content_type="audio/ogg",
+                cleanup=lambda: path.unlink(missing_ok=True),
+            )
+
+    cached_path = str(tmp_path / "cached-voice.ogg")
+
+    def fake_cache(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            path=cached_path,
+            media_type="audio/ogg",
+            context_note=lambda: "[audio 'voice.ogg' saved at: /cache/voice.ogg]",
+        )
+
+    monkeypatch.setattr(
+        "hermes_vk_community.adapter.cache_media_bytes",
+        fake_cache,
+    )
+    adapter._client = cast("VkApiClient", DownloadClient())
+    attachments = [
+        VkAttachment.model_validate(
+            {"type": "audio_message", "audio_message": {"link_ogg": "https://cdn.userapi.com/a.ogg"}}
+        )
+    ]
+
+    paths, media_types, is_voice, text = await adapter._cache_attachments(attachments)
+
+    assert paths == [cached_path]
+    assert media_types == ["audio/ogg"]
+    assert is_voice
+    assert text == ""
 
 
 @pytest.mark.asyncio
