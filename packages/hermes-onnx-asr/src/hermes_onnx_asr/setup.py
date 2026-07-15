@@ -94,11 +94,11 @@ def _quantization_guidance() -> tuple[str, tuple[str, ...]]:
         )
     if system == "darwin" and machine in {"arm64", "aarch64"}:
         return (
-            "fp32",
+            "int8",
             (
-                "Подсказка для Apple Silicon: при CPUExecutionProvider начните с fp32; "
-                "ускорение int8 не гарантировано.",
-                "Выбирайте int8, если важнее экономия памяти, и сравните качество на своей записи.",
+                "Подсказка для Apple Silicon: начните с int8 — он экономит память "
+                "и использует ARM dot-product kernels.",
+                "Если качество на ваших записях хуже ожидаемого, повторите setup с fp32 и сравните результат.",
                 size_hint,
             ),
         )

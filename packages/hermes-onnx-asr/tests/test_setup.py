@@ -61,7 +61,7 @@ def test_t_one_picker_uses_its_only_supported_fp32(monkeypatch: pytest.MonkeyPat
     ("system", "machine", "expected"),
     [
         ("Linux", "x86_64", "fp32"),
-        ("Darwin", "arm64", "fp32"),
+        ("Darwin", "arm64", "int8"),
         ("Linux", "aarch64", "int8"),
         ("Linux", "riscv64", "int8"),
     ],
