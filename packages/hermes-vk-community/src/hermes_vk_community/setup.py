@@ -3,12 +3,12 @@ import asyncio
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from hermes_cli.config import get_env_value, save_env_value, write_platform_config_field
+from hermes_cli.config import get_env_value, read_raw_config, save_env_value, write_platform_config_field
 from hermes_cli.setup import print_error, print_header, print_info, print_success, prompt, prompt_yes_no
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from hermes_vk_community.client import VkApiClient
-from hermes_vk_community.config import API_VERSION
+from hermes_vk_community.config import API_VERSION, VkSettings
 from hermes_vk_community.models import CommunityLongPollSettings, Group, GroupsResponse, User
 
 if TYPE_CHECKING:
@@ -22,6 +22,24 @@ if TYPE_CHECKING:
 VK_BOTS_GUIDE = "https://dev.vk.com/ru/api/bots/getting-started"
 VK_COMMUNITY_URL = "https://vk.com/groups"
 PRIVATE_GROUP_ACCESS = 2
+
+
+def saved_configuration_is_valid() -> bool:
+    """Return whether the active profile has a complete VK YAML block."""
+    try:
+        config = TypeAdapter(dict[str, object]).validate_python(read_raw_config())
+        platforms_value = config.get("platforms", {})
+        if not isinstance(platforms_value, dict):
+            return False
+        platforms = TypeAdapter(dict[str, object]).validate_python(platforms_value)
+        raw_value = platforms.get("vk", {})
+        if not isinstance(raw_value, dict):
+            return False
+        raw = TypeAdapter(dict[str, object]).validate_python(raw_value)
+        VkSettings.model_validate(raw)
+    except ValidationError:
+        return False
+    return True
 
 
 class ResolvedScreenName(BaseModel):
@@ -190,7 +208,9 @@ def interactive_setup() -> None:
     existing_token = get_env_value("VK_COMMUNITY_TOKEN") or ""
     if existing_token:
         print_success("A VK community token is already stored in the active Hermes profile.")
-        if not prompt_yes_no("Reconfigure VK Community?", default=False):
+        if not saved_configuration_is_valid():
+            print_info("The matching platforms.vk configuration is missing or incomplete; setup will repair it.")
+        elif not prompt_yes_no("Reconfigure VK Community?", default=False):
             return
 
     token = prompt("VK community access token", password=True) or existing_token
