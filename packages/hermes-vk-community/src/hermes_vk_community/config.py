@@ -8,6 +8,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 API_VERSION = "5.199"
 MAX_VALIDATION_ERRORS = 20
+HERMES_RUNTIME_EXTRA_KEYS = frozenset(
+    {
+        "group_sessions_per_user",
+        "thread_sessions_per_user",
+    },
+)
 
 
 class LongPollSettings(BaseModel):
@@ -160,6 +166,8 @@ def settings_from_platform_config(config: PlatformConfigLike) -> VkSettings:
     extra = copy.deepcopy(getattr(config, "extra", {}) or {})
     errors = extra.pop("_vk_validation_errors", [])
     extra.pop("_enabled_explicit", None)
+    for key in HERMES_RUNTIME_EXTRA_KEYS:
+        extra.pop(key, None)
     if errors:
         raise ValueError("; ".join(str(error) for error in errors[:MAX_VALIDATION_ERRORS]))
     return VkSettings.model_validate(extra)
