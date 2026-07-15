@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 LONG_POLL_SUFFIXES = ("vk.com", "userapi.com")
-MEDIA_SUFFIXES = ("vk.com", "userapi.com", "vk-cdn.net", "vkuser.net")
+MEDIA_SUFFIXES = ("vk.com", "userapi.com", "vk-cdn.net", "vkuser.net", "vkuserphoto.ru")
 NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
 MIN_PRINTABLE_CODEPOINT = 32
