@@ -39,6 +39,17 @@ def test_unknown_key_is_a_bounded_validation_error() -> None:
     assert result["_vk_validation_errors"][0].startswith("mystery:")
 
 
+def test_gateway_runtime_session_fields_do_not_invalidate_plugin_config() -> None:
+    result = apply_yaml_config({}, {"group_id": 123, "allowed_user_ids": [456]})
+    result["group_sessions_per_user"] = True
+    result["thread_sessions_per_user"] = False
+
+    settings = settings_from_platform_config(PlatformConfigStub(result))
+
+    assert settings.group_id == 123
+    assert settings.allowed_user_ids == [456]
+
+
 @pytest.mark.parametrize("key", ["VK_COMMUNITY_TOKEN", "access_token_env"])
 def test_token_is_rejected_in_yaml(key: str) -> None:
     result = apply_yaml_config({}, {"group_id": 1, "allowed_user_ids": [2], key: "secret"})
