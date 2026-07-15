@@ -636,7 +636,7 @@ wheels = [
 
 [[package]]
 name = "hermes-onnx-asr"
-version = "1.0.1"
+version = "1.0.2"
 source = { editable = "packages/hermes-onnx-asr" }
 dependencies = [
     { name = "filelock" },
@@ -700,7 +700,7 @@ dev = [
 
 [[package]]
 name = "hermes-vk-community"
-version = "1.0.1"
+version = "1.0.2"
 source = { editable = "packages/hermes-vk-community" }
 dependencies = [
     { name = "aiohttp" },
