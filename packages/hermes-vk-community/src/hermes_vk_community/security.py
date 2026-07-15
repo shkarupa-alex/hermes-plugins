@@ -13,8 +13,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 LONG_POLL_SUFFIXES = ("vk.com", "userapi.com")
-MEDIA_SUFFIXES = ("userapi.com", "vk-cdn.net", "vkuser.net")
+MEDIA_SUFFIXES = ("vk.com", "userapi.com", "vk-cdn.net", "vkuser.net")
 NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
 MIN_PRINTABLE_CODEPOINT = 32
 MAX_HOST_LENGTH = 253
 MAX_LABEL_LENGTH = 63
@@ -67,7 +68,11 @@ def validate_global_address(value: str) -> str:
         embedded = address.ipv4_mapped
         if address in NAT64_WELL_KNOWN:
             embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
-    if not address.is_global or (embedded is not None and not embedded.is_global):
+    if (
+        not address.is_global
+        or (isinstance(address, ipaddress.IPv4Address) and address in CGNAT)
+        or (embedded is not None and (not embedded.is_global or embedded in CGNAT))
+    ):
         raise VkSecurityError(f"non-global address rejected: {address}")
     return str(address)
 

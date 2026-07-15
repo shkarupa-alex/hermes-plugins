@@ -17,3 +17,12 @@ class VkSecurityError(ValueError):
 
 class VkDeliveryUnknownError(TimeoutError):
     pass
+
+
+@dataclass(slots=True)
+class VkHttpError(Exception):
+    status: int
+    operation: str
+
+    def __str__(self) -> str:
+        return f"VK {self.operation} HTTP error {self.status}"

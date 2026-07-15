@@ -1,24 +1,30 @@
 from __future__ import annotations
 import os
 import shutil
+import stat
 import tempfile
 import time
 import wave
+from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from hermes_cli.config import load_config
+from hermes_constants import get_hermes_home
 from pydantic import ValidationError
 
 from hermes_onnx_asr.catalog import bundle_path, fetch_bundle, load_catalog, verify_bundle
 from hermes_onnx_asr.compat import check_compatibility, check_requirements
 from hermes_onnx_asr.config import load_settings
 from hermes_onnx_asr.errors import OnnxAsrError
-from hermes_onnx_asr.pipeline import load_pipeline
+from hermes_onnx_asr.pipeline import audit_cpu_sessions, load_pipeline
 from hermes_onnx_asr.provider import provider
 from hermes_onnx_asr.setup import interactive_setup
 
 if TYPE_CHECKING:
     import argparse
+
+PRIVATE_DIRECTORY_MODE = 0o700
 
 
 def setup_parser(parser: argparse.ArgumentParser) -> None:
@@ -92,18 +98,48 @@ def _warmup() -> int:
         settings = load_settings()
         pipeline = load_pipeline(settings)
         with tempfile.TemporaryDirectory(prefix="hermes-onnx-asr-warmup-") as directory:
-            sample = Path(directory) / "silence.wav"
-            with wave.open(str(sample), "wb") as audio:
-                audio.setnchannels(1)
-                audio.setsampwidth(2)
-                audio.setframerate(16_000)
-                audio.writeframes(b"\0\0" * 4_000)
-            pipeline.base_model.recognize(sample, channel="mean")
+            fixture = files("hermes_onnx_asr").joinpath("data/russian-warmup.wav")
+            sample = Path(directory) / "russian.wav"
+            sample.write_bytes(fixture.read_bytes())
+            transcript = str(pipeline.base_model.recognize(sample, channel="mean")).strip()
+            _require_russian_warmup(transcript)
+            if pipeline.vad_model is not None:
+                long_sample = Path(directory) / "russian-vad.wav"
+                _repeat_wav(sample, long_sample, minimum_seconds=21)
+                _require_vad_warmup(
+                    detected=any(str(segment.text).strip() for segment in pipeline.vad_model.recognize(long_sample))
+                )
+            pipeline.audit = audit_cpu_sessions(
+                pipeline.base_model,
+                pipeline.vad_model,
+                model_alias=settings.model,
+            )
     except (OnnxAsrError, OSError, ValidationError, ValueError) as exc:
         print(f"Warm-up failed: {exc}")
         return 1
     print(f"Warm-up passed; audited {len(pipeline.audit.roles)} CPU-only ONNX sessions")
     return 0
+
+
+def _repeat_wav(source: Path, destination: Path, *, minimum_seconds: int) -> None:
+    with wave.open(str(source), "rb") as input_audio:
+        params = input_audio.getparams()
+        frame_count = input_audio.getnframes()
+        frames = input_audio.readframes(frame_count)
+        repeats = max(1, int(minimum_seconds * input_audio.getframerate() / frame_count) + 1)
+    with wave.open(str(destination), "wb") as output_audio:
+        output_audio.setparams(params)
+        output_audio.writeframes(frames * repeats)
+
+
+def _require_russian_warmup(transcript: str) -> None:
+    if not transcript or "проверк" not in transcript.casefold():
+        raise ValueError("Russian speech fixture was not recognized")
+
+
+def _require_vad_warmup(*, detected: bool) -> None:
+    if not detected:
+        raise ValueError("VAD warm-up detected no Russian speech")
 
 
 def _cleanup_stale_temp(ttl_seconds: int) -> int:
@@ -116,6 +152,8 @@ def _cleanup_stale_temp(ttl_seconds: int) -> int:
             if path.is_symlink() or not path.is_dir() or now - stat_result.st_mtime < ttl_seconds:
                 continue
             if hasattr(os, "getuid") and stat_result.st_uid != os.getuid():
+                continue
+            if stat.S_IMODE(stat_result.st_mode) != PRIVATE_DIRECTORY_MODE:
                 continue
             shutil.rmtree(path)
             removed += 1
@@ -136,11 +174,20 @@ def _doctor() -> int:
         print(f"Configuration:  invalid ({exc})")
         return 1
     print("Provider:       onnx_asr")
+    config = load_config()
+    enabled = "onnx-asr" in set(config.get("plugins", {}).get("enabled", []))
+    print(f"Discovery:      {'enabled' if enabled else 'installed but not enabled'}")
+    if not enabled:
+        return 1
     print(f"Model:          {settings.model} / {settings.quantization or 'fp32'}")
     threshold = settings.vad.min_audio_seconds
     vad_status = "disabled" if threshold is None else f"{settings.vad.engine}, threshold {threshold:g}s"
     print(f"VAD:            {vad_status}")
     print("Execution:      CPUExecutionProvider only")
+    print("GigaAM copies:  1 (base model shared with VAD wrapper)")
+    scheduler = provider.scheduler_diagnostics()
+    print(f"Queue:          {scheduler['queued']} queued; shutting_down={scheduler['shutting_down']}")
+    print(f"Profile:        {get_hermes_home().resolve()} (one profile per process)")
     print(f"Runtime fetch:  {'enabled' if settings.allow_runtime_download else 'disabled'}")
     print(f"ffmpeg:         {'ready' if shutil.which('ffmpeg') else 'missing (needed for non-PCM audio)'}")
     model_path = bundle_path(settings.model_dir, settings.model, settings.quantization)

@@ -62,3 +62,32 @@ def test_one_provider_rejects_profile_switch(monkeypatch: pytest.MonkeyPatch, tm
     with pytest.raises(OnnxAsrError) as caught:
         provider._bind_profile()
     assert caught.value.code == "configuration_invalid"
+
+
+def test_expired_waiter_is_removed_from_fifo_and_releases_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(_scheduler: _Scheduler, job: _Job) -> dict[str, object]:
+        if job.source.name == "running.wav":
+            started.set()
+            release.wait(timeout=2)
+        return {"success": True, "transcript": "ok", "provider": "onnx_asr"}
+
+    monkeypatch.setattr(_Scheduler, "_execute", execute)
+    scheduler = _Scheduler(queue_depth=1)
+    settings = OnnxAsrSettings(runtime=RuntimeSettings(queue_depth=1))
+    running = _Job(Path("running.wav"), settings, None, time.monotonic() + 10, Future())
+    expired = _Job(Path("expired.wav"), settings, None, time.monotonic() + 0.01, Future())
+    replacement = _Job(Path("replacement.wav"), settings, None, time.monotonic() + 10, Future())
+    try:
+        assert scheduler.submit(running)
+        assert started.wait(timeout=1)
+        assert scheduler.submit(expired)
+        time.sleep(0.02)
+        assert scheduler.cancel_queued(expired)
+        assert scheduler.queued == 0
+        assert scheduler.submit(replacement)
+    finally:
+        release.set()
+        scheduler.shutdown()

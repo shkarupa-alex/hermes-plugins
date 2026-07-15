@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run pyright
+      - run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
+      - run: uv build --all-packages
+
+  os-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.13"
+          - os: macos-13
+            python: "3.13"
+          - os: macos-14
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --all-packages --locked
+      - run: uv run pytest -q
+
+  hermes-compatibility:
+    strategy:
+      matrix:
+        hermes: ["0.18.2", "latest"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - if: matrix.hermes != 'latest'
+        run: uv pip install "hermes-agent==${{ matrix.hermes }}"
+      - run: uv run pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
+
+  hermes-main-warning:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - run: uv pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main"
+      - run: uv run pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests

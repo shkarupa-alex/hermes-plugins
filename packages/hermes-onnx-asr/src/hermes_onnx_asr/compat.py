@@ -10,6 +10,15 @@ MIN_HERMES = Version("0.18.2")
 MAX_HERMES = Version("0.19")
 
 
+EXPECTED_TRANSCRIBE_SHAPE = (
+    ("self", inspect.Parameter.POSITIONAL_OR_KEYWORD, False),
+    ("file_path", inspect.Parameter.POSITIONAL_OR_KEYWORD, False),
+    ("model", inspect.Parameter.KEYWORD_ONLY, True),
+    ("language", inspect.Parameter.KEYWORD_ONLY, True),
+    ("extra", inspect.Parameter.VAR_KEYWORD, False),
+)
+
+
 def check_compatibility() -> tuple[bool, str]:
     try:
         installed = Version(version("hermes-agent"))
@@ -17,10 +26,21 @@ def check_compatibility() -> tuple[bool, str]:
         return False, f"Hermes Agent is unavailable: {exc}"
     if not MIN_HERMES <= installed < MAX_HERMES:
         return False, f"Hermes Agent {installed} is outside the tested range >=0.18.2,<0.19"
-    required = {"file_path", "model", "language", "extra"}
     parameters = inspect.signature(TranscriptionProvider.transcribe).parameters
-    if not required.issubset(parameters):
-        return False, "Hermes TranscriptionProvider.transcribe contract has changed"
+    shape = tuple(
+        (parameter.name, parameter.kind, parameter.default is not inspect.Parameter.empty)
+        for parameter in parameters.values()
+    )
+    if shape != EXPECTED_TRANSCRIBE_SHAPE:
+        return False, f"Hermes TranscriptionProvider.transcribe contract has changed: {shape}"
+    from hermes_onnx_asr.provider import OnnxAsrProvider  # noqa: PLC0415
+
+    provider_shape = tuple(
+        (parameter.name, parameter.kind, parameter.default is not inspect.Parameter.empty)
+        for parameter in inspect.signature(OnnxAsrProvider.transcribe).parameters.values()
+    )
+    if provider_shape != EXPECTED_TRANSCRIBE_SHAPE:
+        return False, f"OnnxAsrProvider.transcribe signature drifted: {provider_shape}"
     if not callable(getattr(PluginContext, "register_transcription_provider", None)):
         return False, "Hermes does not expose register_transcription_provider"
     return True, f"Hermes Agent {installed} transcription contract is compatible"

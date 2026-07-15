@@ -94,6 +94,31 @@ class VkMessage(VkModel):
     reply_message: JsonObject | None = None
     fwd_messages: list[JsonObject] = Field(default_factory=list[JsonObject])
     payload: str | None = None
+    format_data: JsonObject | None = None
+
+
+class KeyboardAction(VkModel):
+    type: str = "text"
+    label: str
+    payload: str
+
+
+class KeyboardButton(VkModel):
+    action: KeyboardAction
+    color: str = "secondary"
+
+
+class VkKeyboard(VkModel):
+    one_time: bool = True
+    inline: bool = False
+    buttons: list[list[KeyboardButton]]
+
+
+class InteractionPayload(VkModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(alias="v")
+    nonce: str = Field(alias="n", min_length=16, max_length=64)
 
 
 class MessageNewObject(VkModel):
@@ -110,6 +135,82 @@ class VkUpdate(VkModel):
 
 class SendResponse(VkModel):
     message_id: int
+
+
+class PhotoUploadResponse(VkModel):
+    server: int
+    photo: str
+    hash: str
+
+
+class UploadServer(VkModel):
+    upload_url: str
+
+
+class SavedPhoto(VkModel):
+    owner_id: int
+    id: int
+    access_key: str | None = None
+
+
+class DocumentUploadResponse(VkModel):
+    file: str
+
+
+class SavedDocument(VkModel):
+    owner_id: int
+    id: int
+    access_key: str | None = None
+
+
+class SaveDocumentResponse(VkModel):
+    type: str | None = None
+    doc: SavedDocument | None = None
+    audio_message: SavedDocument | None = None
+
+
+class FormattingProbeCase(VkModel):
+    name: str
+    operation: str
+    request_message: str
+    request_length: int | None = None
+    request_sha256: str | None = None
+    send_status: str
+    readback_text: str | None = None
+    readback_length: int | None = None
+    readback_sha256: str | None = None
+    readback_format_data: JsonObject | None = None
+    error_code: int | None = None
+
+
+class FormattingProbeArtifact(VkModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    api_version: str
+    peer_id: str = "<redacted>"
+    generated_at: str
+    cases: list[FormattingProbeCase]
+
+
+class CapabilityClient(VkModel):
+    name: str
+    version: str
+    manual_visual_check: bool
+
+
+class VkCapabilityProfile(VkModel):
+    schema_version: int
+    api_version: str
+    tested_at: str
+    profile: str
+    rich_send: bool
+    rich_edit: bool
+    format_data_observed: bool
+    send_limit: int
+    typing_indicator_visible: bool
+    observations: dict[str, str]
+    clients: list[CapabilityClient]
 
 
 class User(VkModel):

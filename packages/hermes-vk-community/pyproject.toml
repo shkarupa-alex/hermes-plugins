@@ -13,6 +13,7 @@ authors = [{ name = "Hermes VK Community contributors" }]
 dependencies = [
     "aiohttp==3.14.1",
     "aiosqlite==0.22.1",
+    "filetype==1.2.0",
     "hermes-agent>=0.18.2,<0.19",
     "markdown-it-py>=4.0.0,<5",
     "packaging>=24,<27",

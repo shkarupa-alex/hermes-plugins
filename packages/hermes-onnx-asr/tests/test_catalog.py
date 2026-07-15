@@ -22,6 +22,8 @@ def fake_catalog() -> Catalog:
                 repository="owner/repository",
                 revision="a" * 40,
                 quantizations=["int8"],
+                files={"int8": ["model.onnx"]},
+                download="huggingface_snapshot",
             ),
         ],
         vads=[],

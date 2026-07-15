@@ -1,5 +1,9 @@
 from __future__ import annotations
+import asyncio
 import logging
+import mimetypes
+import ssl
+import stat
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import urljoin
@@ -8,17 +12,27 @@ import aiohttp
 from pydantic import TypeAdapter
 
 from hermes_vk_community.config import API_VERSION, MediaSettings
-from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError
 from hermes_vk_community.models import LongPollLease, LongPollResponse, VkApiEnvelope
 from hermes_vk_community.security import LONG_POLL_SUFFIXES, MEDIA_SUFFIXES, VkPinnedResolver, validate_https_url
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 MAX_MEDIA_REDIRECTS = 3
+HTTP_REDIRECT_MIN = 300
+HTTP_ERROR_MIN = 400
+
+
+def _connector(resolver: VkPinnedResolver) -> aiohttp.TCPConnector:
+    context = ssl.create_default_context()
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return aiohttp.TCPConnector(resolver=resolver, use_dns_cache=False, ssl=context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +79,8 @@ class VkApiClient:
         url = f"https://api.vk.com/method/{method}"
         try:
             async with self._session.post(url, data=form, allow_redirects=False) as response:
-                response.raise_for_status()
+                if response.status >= HTTP_ERROR_MIN:
+                    raise VkHttpError(response.status, "API")
                 payload = await response.json(content_type=None)
         except TimeoutError as exc:
             raise VkDeliveryUnknownError("VK request timed out") from exc
@@ -82,7 +97,7 @@ class VkApiClient:
         validate_https_url(lease.server, suffixes=LONG_POLL_SUFFIXES)
         timeout = aiohttp.ClientTimeout(total=wait_seconds + 10, connect=self._media.connect_timeout_seconds)
         resolver = VkPinnedResolver(LONG_POLL_SUFFIXES)
-        connector = aiohttp.TCPConnector(resolver=resolver, use_dns_cache=False)
+        connector = _connector(resolver)
         try:
             async with (
                 aiohttp.ClientSession(
@@ -96,7 +111,9 @@ class VkApiClient:
                     allow_redirects=False,
                 ) as response,
             ):
-                response.raise_for_status()
+                if response.status >= HTTP_ERROR_MIN:
+                    # Never construct ClientResponseError: its URL contains the Long Poll key.
+                    raise VkHttpError(response.status, "Long Poll")
                 return LongPollResponse.model_validate(await response.json(content_type=None))
         finally:
             await resolver.close()
@@ -106,7 +123,7 @@ class VkApiClient:
         for redirect_count in range(MAX_MEDIA_REDIRECTS + 1):
             validate_https_url(current_url, suffixes=MEDIA_SUFFIXES)
             resolver = VkPinnedResolver(MEDIA_SUFFIXES)
-            connector = aiohttp.TCPConnector(resolver=resolver, use_dns_cache=False)
+            connector = _connector(resolver)
             timeout = aiohttp.ClientTimeout(
                 total=self._media.total_timeout_seconds,
                 connect=self._media.connect_timeout_seconds,
@@ -128,7 +145,11 @@ class VkApiClient:
                             raise ValueError("VK media redirect has no Location")
                         current_url = urljoin(current_url, location)
                         continue
-                    response.raise_for_status()
+                    if HTTP_REDIRECT_MIN <= response.status < HTTP_ERROR_MIN:
+                        raise VkHttpError(response.status, "media redirect")
+                    if response.status >= HTTP_ERROR_MIN:
+                        # Access keys can be embedded in media URLs, so keep the URL out of errors.
+                        raise VkHttpError(response.status, "media download")
                     declared = response.content_length
                     if declared is not None and declared > self._media.max_download_bytes:
                         raise ValueError("VK media exceeds configured download limit")
@@ -138,6 +159,39 @@ class VkApiClient:
             finally:
                 await resolver.close()
         raise RuntimeError("unreachable VK media redirect state")
+
+    async def upload_file(self, url: str, field: str, path: Path, *, content_type: str | None = None) -> object:
+        """Upload one local file to a VK-issued, pinned HTTPS endpoint without redirects."""
+        validate_https_url(url, suffixes=MEDIA_SUFFIXES)
+        try:
+            stat_result = await asyncio.to_thread(path.stat)
+        except OSError as exc:
+            raise ValueError("VK upload file is missing") from exc
+        if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_size > self._media.max_download_bytes:
+            raise ValueError("VK upload file is missing or exceeds the configured byte limit")
+        resolver = VkPinnedResolver(MEDIA_SUFFIXES)
+        connector = _connector(resolver)
+        timeout = aiohttp.ClientTimeout(
+            total=self._media.total_timeout_seconds, connect=self._media.connect_timeout_seconds
+        )
+        mime = content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        try:
+            with path.open("rb") as handle:
+                form = aiohttp.FormData()
+                form.add_field(field, handle, filename=path.name, content_type=mime)
+                async with (
+                    aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as session,
+                    session.post(url, data=form, allow_redirects=False) as response,
+                ):
+                    if HTTP_REDIRECT_MIN <= response.status < HTTP_ERROR_MIN:
+                        raise VkHttpError(response.status, "upload redirect")
+                    if response.status >= HTTP_ERROR_MIN:
+                        raise VkHttpError(response.status, "upload")
+                    return await response.json(content_type=None)
+        except TimeoutError as exc:
+            raise VkDeliveryUnknownError("VK upload timed out") from exc
+        finally:
+            await resolver.close()
 
 
 def _form_value(value: object) -> str:

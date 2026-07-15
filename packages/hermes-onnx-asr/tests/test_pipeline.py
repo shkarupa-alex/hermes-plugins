@@ -7,7 +7,7 @@ import pytest
 
 from hermes_onnx_asr.config import OnnxAsrSettings
 from hermes_onnx_asr.errors import OnnxAsrError
-from hermes_onnx_asr.pipeline import CPU_PROVIDERS, audit_cpu_sessions, load_pipeline, recognize
+from hermes_onnx_asr.pipeline import CPU_PROVIDERS, RESAMPLER_RATES, audit_cpu_sessions, load_pipeline, recognize
 
 
 class FakeSession:
@@ -25,7 +25,7 @@ class BaseModel:
             _decoder=FakeSession(),
             _joiner=FakeSession(),
         )
-        self.resampler = SimpleNamespace(_preprocessors={8000: FakeSession()})
+        self.resampler = SimpleNamespace(_preprocessors={rate: FakeSession() for rate in RESAMPLER_RATES})
         self.transcript = transcript
         self.calls: list[tuple[Path, str]] = []
 
@@ -52,6 +52,24 @@ def test_cpu_audit_rejects_non_cpu_session() -> None:
     with pytest.raises(OnnxAsrError) as caught:
         audit_cpu_sessions(model, None)
     assert caught.value.code == "cpu_provider_violation"
+
+
+def test_cpu_audit_accepts_nemo_rnnt_role_manifest() -> None:
+    model = BaseModel()
+    model.asr = SimpleNamespace(_encoder=FakeSession(), _decoder_joint=FakeSession())
+    audit = audit_cpu_sessions(model, None, model_alias="nemo-fastconformer-ru-rnnt")
+    assert {"asr.encoder", "asr.decoder_joint"}.issubset(audit.roles)
+
+
+def test_cpu_audit_rejects_duplicate_and_unknown_sessions() -> None:
+    model = BaseModel()
+    model.asr._decoder = model.asr._encoder
+    with pytest.raises(OnnxAsrError):
+        audit_cpu_sessions(model, None)
+    model = BaseModel()
+    model.asr._surprise = FakeSession()
+    with pytest.raises(OnnxAsrError):
+        audit_cpu_sessions(model, None)
 
 
 @pytest.mark.parametrize(

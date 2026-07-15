@@ -1,10 +1,10 @@
 from __future__ import annotations
 import atexit
 import importlib.util
-import queue
 import tempfile
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -39,9 +39,10 @@ class _Job:
 
 class _Scheduler:
     def __init__(self, queue_depth: int) -> None:
-        self._jobs: queue.Queue[_Job | None] = queue.Queue()
-        self._admission = threading.BoundedSemaphore(1 + queue_depth)
+        self._jobs: deque[_Job] = deque()
         self._state_lock = threading.Lock()
+        self._condition = threading.Condition(self._state_lock)
+        self._admission = threading.BoundedSemaphore(1 + queue_depth)
         self._pipeline: Pipeline | None = None
         self._pipeline_key: tuple[object, ...] | None = None
         self._shutting_down = False
@@ -50,7 +51,8 @@ class _Scheduler:
 
     @property
     def queued(self) -> int:
-        return self._jobs.qsize()
+        with self._state_lock:
+            return len(self._jobs)
 
     @property
     def pipeline(self) -> Pipeline | None:
@@ -64,7 +66,18 @@ class _Scheduler:
         with self._state_lock:
             if self._shutting_down or not self._admission.acquire(blocking=False):
                 return False
-            self._jobs.put(job)
+            self._jobs.append(job)
+            self._condition.notify()
+            return True
+
+    def cancel_queued(self, job: _Job) -> bool:
+        """Remove an expired job only if the worker has not claimed it."""
+        with self._state_lock:
+            try:
+                self._jobs.remove(job)
+            except ValueError:
+                return False
+            self._admission.release()
             return True
 
     def _key(self, settings: OnnxAsrSettings) -> tuple[object, ...]:
@@ -89,7 +102,7 @@ class _Scheduler:
         key = self._key(settings)
         if self._pipeline is not None and self._pipeline_key == key:
             return self._pipeline
-        if self._pipeline is not None and self._jobs.qsize() > 0:
+        if self._pipeline is not None and self.queued > 0:
             raise safe_error("model_switch_busy")
         replacement = load_pipeline(settings)
         self._pipeline = replacement
@@ -119,9 +132,12 @@ class _Scheduler:
 
     def _run(self) -> None:
         while True:
-            job = self._jobs.get()
-            if job is None:
-                return
+            with self._state_lock:
+                while not self._jobs and not self._shutting_down:
+                    self._condition.wait()
+                if not self._jobs and self._shutting_down:
+                    return
+                job = self._jobs.popleft()
             try:
                 if time.monotonic() >= job.deadline:
                     result = failure_result(safe_error("asr_timeout"))
@@ -135,23 +151,17 @@ class _Scheduler:
                 job.future.set_result(result)
             finally:
                 self._admission.release()
-                self._jobs.task_done()
 
     def shutdown(self, grace_seconds: float = 30) -> None:
         with self._state_lock:
             if self._shutting_down:
                 return
             self._shutting_down = True
-            while True:
-                try:
-                    job = self._jobs.get_nowait()
-                except queue.Empty:
-                    break
-                if job is not None:
-                    job.future.set_result(failure_result(safe_error("provider_shutting_down")))
-                    self._admission.release()
-                self._jobs.task_done()
-            self._jobs.put(None)
+            while self._jobs:
+                job = self._jobs.popleft()
+                job.future.set_result(failure_result(safe_error("provider_shutting_down")))
+                self._admission.release()
+            self._condition.notify_all()
         self._worker.join(timeout=grace_seconds)
 
 
@@ -248,6 +258,7 @@ class OnnxAsrProvider(TranscriptionProvider):
             try:
                 return future.result(timeout=timeout)
             except FutureTimeoutError:
+                scheduler.cancel_queued(job)
                 return failure_result(safe_error("asr_timeout"))
         except (ValidationError, ValueError):
             return failure_result(safe_error("configuration_invalid"))
@@ -260,6 +271,14 @@ class OnnxAsrProvider(TranscriptionProvider):
         scheduler = self._scheduler
         if scheduler is not None:
             scheduler.shutdown()
+
+    def scheduler_diagnostics(self) -> dict[str, object]:
+        scheduler = self._scheduler
+        return {
+            "queued": scheduler.queued if scheduler is not None else 0,
+            "shutting_down": scheduler.is_shutting_down if scheduler is not None else False,
+            "pipeline_loaded": scheduler.pipeline is not None if scheduler is not None else False,
+        }
 
 
 provider = OnnxAsrProvider()

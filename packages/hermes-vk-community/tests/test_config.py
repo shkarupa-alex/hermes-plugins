@@ -1,9 +1,11 @@
 from __future__ import annotations
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
+from hermes_vk_community import adapter
 from hermes_vk_community.config import PolicyEnvironment, apply_yaml_config, settings_from_platform_config
 
 
@@ -64,3 +66,7 @@ def test_rich_mode_requires_probe_profile() -> None:
         {"group_id": 1, "allowed_user_ids": [2], "formatting": {"mode": "rich"}},
     )
     assert "capability profile" in result["_vk_validation_errors"][0]
+
+
+def test_runtime_never_reads_vk_token_with_os_getenv() -> None:
+    assert 'os.getenv("VK_COMMUNITY_TOKEN")' not in inspect.getsource(adapter)

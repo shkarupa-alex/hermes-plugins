@@ -14,12 +14,12 @@ from typing import Literal
 
 from filelock import FileLock
 from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
-from onnx_asr.loader import create_asr_resolver, create_vad_resolver
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from hermes_onnx_asr.errors import OnnxAsrError, safe_error
 
 MANIFEST_SCHEMA_VERSION = 1
+GIT_COMMIT_LENGTH = 40
 
 
 class CatalogEntry(BaseModel):
@@ -29,6 +29,15 @@ class CatalogEntry(BaseModel):
     repository: str
     revision: str
     quantizations: list[str | None]
+    files: dict[str, list[str]]
+    download: Literal["huggingface_snapshot"]
+
+    @field_validator("revision")
+    @classmethod
+    def immutable_revision(cls, value: str) -> str:
+        if len(value) != GIT_COMMIT_LENGTH or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("catalog revision must be a lowercase 40-character Git commit")
+        return value
 
 
 class Catalog(BaseModel):
@@ -83,8 +92,12 @@ def bundle_path(root: Path, alias: str, quantization: str | None, *, kind: Liter
 
 
 def _expected_patterns(alias: str, quantization: str | None, kind: Literal["model", "vad"]) -> list[str]:
-    resolver = create_asr_resolver(alias) if kind == "model" else create_vad_resolver(alias)
-    patterns = list(resolver.model_type._get_model_files(quantization).values())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    entry = catalog_entry(alias, quantization, kind=kind)
+    key = quantization or "fp32"
+    try:
+        patterns = entry.files[key]
+    except KeyError as exc:
+        raise safe_error("model_not_in_catalog" if kind == "model" else "vad_not_installed") from exc
     return [
         "config.json",
         "config.yaml",
@@ -139,6 +152,7 @@ def _write_manifest(
     quantization: str | None,
     kind: Literal["model", "vad"],
 ) -> BundleManifest:
+    _fsync_files(directory)
     draft = BundleManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         kind=kind,
@@ -160,6 +174,13 @@ def _write_manifest(
     with manifest_path.open("rb") as handle:
         os.fsync(handle.fileno())
     return manifest
+
+
+def _fsync_files(directory: Path) -> None:
+    for path in directory.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
 
 
 def verify_bundle(

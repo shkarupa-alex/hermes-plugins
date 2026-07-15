@@ -1,10 +1,11 @@
+# pyright: reportPrivateUsage=false
 from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
 import pytest
 
-from hermes_vk_community.storage import VkStorage, canonical_json
+from hermes_vk_community.storage import MAX_NORMALIZED_JSON_LENGTH, VkStorage, canonical_json
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,6 +42,72 @@ async def test_sending_rows_become_delivery_unknown_after_restart(tmp_path: Path
     await storage.close()
     reopened = VkStorage(path)
     await reopened.open()
+    assert (await reopened.counts())["outbox_delivery_unknown"] == 1
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_update_is_quarantined_before_cursor_advances(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    update: JsonObject = {
+        "type": "message_new",
+        "event_id": "huge",
+        "group_id": 1,
+        "object": {"message": {"peer_id": 2, "text": "x" * MAX_NORMALIZED_JSON_LENGTH}},
+    }
+    inserted = await storage.admit_batch(1, [update], "99")
+    assert inserted
+    assert await storage.cursor(1) == "99"
+    assert await storage.received() == []
+    db = storage._connection()
+    async with db.execute("SELECT state,error,length(normalized_json) FROM inbox") as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row[:2] == ("quarantined", "normalized update exceeds 262144 characters")
+    assert 0 < row[2] < 1024
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_pairing_code_is_hashed_expiring_and_one_time(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    await storage.create_pairing_code("VK-SECRET", 600)
+    db = storage._connection()
+    async with db.execute("SELECT code_sha256 FROM pairing_codes") as cursor:
+        row = await cursor.fetchone()
+    assert row
+    assert row[0] != "VK-SECRET"
+    assert await storage.consume_pairing_code("VK-SECRET", 42)
+    assert not await storage.consume_pairing_code("VK-SECRET", 43)
+    assert await storage.is_paired(42)
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_outbox_retains_recoverable_wire_payload(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    original = (await storage.prepare_outbox(2, ["hello"], "7"))[0]
+    recovered = (await storage.prepared_outbox())[0]
+    assert recovered.id == original.id
+    assert recovered.wire_content == "hello"
+    assert recovered.reply_target == "7"
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_nonrecoverable_outbox_is_not_replayed_as_plain_text(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "vk.sqlite3")
+    await storage.open()
+    await storage.prepare_outbox(2, ["media caption"], None, recoverable=False)
+    assert await storage.prepared_outbox() == []
+    await storage.close()
+
+    reopened = VkStorage(tmp_path / "vk.sqlite3")
+    await reopened.open()
+    assert await reopened.prepared_outbox() == []
     assert (await reopened.counts())["outbox_delivery_unknown"] == 1
     await reopened.close()
 

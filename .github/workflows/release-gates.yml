@@ -1,0 +1,82 @@
+name: Release gates
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cpu-session-audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --locked
+      - name: Configure isolated Hermes profile
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/hermes-profile"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n' > "$RUNNER_TEMP/hermes-profile/config.yaml"
+          echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr doctor
+      - name: Prove runtime is offline
+        shell: bash
+        run: |
+          export HERMES_ASR_RELEASE_MODEL_DIR="$HERMES_HOME/models/onnx-asr"
+          uv run pytest -q -m asr_live integration-tests/test_asr_offline_runtime.py
+
+  asr-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - name: Require versioned Russian corpus artifact
+        run: test -f release-corpus/manifest.jsonl
+      - run: test -f release-corpus/baseline.json
+      - run: uv run python tools/asr_corpus_gate.py release-corpus/manifest.jsonl --baseline release-corpus/baseline.json
+
+  advertised-model-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - gigaam-v2-ctc
+          - gigaam-v2-rnnt
+          - gigaam-v3-ctc
+          - gigaam-v3-rnnt
+          - gigaam-v3-e2e-ctc
+          - gigaam-v3-e2e-rnnt
+          - nemo-fastconformer-ru-ctc
+          - nemo-fastconformer-ru-rnnt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - name: Configure model profile
+        run: |
+          mkdir -p "$RUNNER_TEMP/hermes-profile"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: ${{ matrix.model }}\n    quantization: int8\n    vad:\n      min_audio_seconds: null\n' > "$RUNNER_TEMP/hermes-profile/config.yaml"
+          echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "${{ matrix.model }}" --quantization int8
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr warmup
+
+  vk-live:
+    if: ${{ secrets.VK_COMMUNITY_TOKEN != '' && secrets.VK_GROUP_ID != '' && secrets.VK_TEST_PEER_ID != '' }}
+    runs-on: ubuntu-latest
+    env:
+      VK_COMMUNITY_TOKEN: ${{ secrets.VK_COMMUNITY_TOKEN }}
+      VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
+      VK_TEST_PEER_ID: ${{ secrets.VK_TEST_PEER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - run: uv run pytest -q -m vk_live
