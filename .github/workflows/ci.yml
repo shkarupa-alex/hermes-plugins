@@ -46,15 +46,17 @@ jobs:
   hermes-compatibility:
     strategy:
       matrix:
-        hermes: ["0.18.2", "latest"]
+        hermes: ["0.18.2", "latest-supported"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
-      - if: matrix.hermes != 'latest'
+      - if: matrix.hermes == '0.18.2'
         run: uv pip install "hermes-agent==${{ matrix.hermes }}"
-      - run: uv run pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
+      - if: matrix.hermes == 'latest-supported'
+        run: uv pip install --upgrade "hermes-agent>=0.18.2,<0.19"
+      - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
 
   hermes-main-warning:
     continue-on-error: true
@@ -64,4 +66,4 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
       - run: uv pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main"
-      - run: uv run pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
+      - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests

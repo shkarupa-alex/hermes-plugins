@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Generic, TypeAlias, TypeVar
+from typing import Generic, Literal, TypeAlias, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -80,6 +80,9 @@ class VkAttachment(VkModel):
     video: JsonObject | None = None
     sticker: JsonObject | None = None
     link: JsonObject | None = None
+    poll: JsonObject | None = None
+    wall: JsonObject | None = None
+    article: JsonObject | None = None
 
 
 class VkMessage(VkModel):
@@ -94,6 +97,7 @@ class VkMessage(VkModel):
     reply_message: JsonObject | None = None
     fwd_messages: list[JsonObject] = Field(default_factory=list[JsonObject])
     payload: str | None = None
+    geo: JsonObject | None = None
     format_data: JsonObject | None = None
 
 
@@ -117,7 +121,7 @@ class VkKeyboard(VkModel):
 class InteractionPayload(VkModel):
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(alias="v")
+    version: Literal[1] = Field(alias="v")
     nonce: str = Field(alias="n", min_length=16, max_length=64)
 
 

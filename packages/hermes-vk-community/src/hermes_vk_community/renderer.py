@@ -27,6 +27,13 @@ class ParsedIncomingMessage:
     format_data: dict[str, object] | None
 
 
+@dataclass(frozen=True, slots=True)
+class WireChunk:
+    text: str
+    start: int
+    end: int
+
+
 class VkMessageRenderer(Protocol):
     def render_markdown(self, markdown: str) -> RenderedVkMessage: ...
 
@@ -58,13 +65,18 @@ def sanitize_incoming_text(text: str) -> str:
 
 
 def split_message(text: str, limit: int) -> list[str]:
+    return [chunk.text for chunk in split_message_with_spans(text, limit)]
+
+
+def split_message_with_spans(text: str, limit: int) -> list[WireChunk]:
     if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    remaining = text
-    while remaining:
+        return [WireChunk(text=text, start=0, end=len(text))]
+    chunks: list[WireChunk] = []
+    start = 0
+    while start < len(text):
+        remaining = text[start:]
         if len(remaining) <= limit:
-            chunks.append(remaining)
+            chunks.append(WireChunk(text=remaining, start=start, end=len(text)))
             break
         split_at = remaining.rfind("\n\n", 0, limit + 1)
         if split_at < limit // 3:
@@ -73,12 +85,16 @@ def split_message(text: str, limit: int) -> list[str]:
             split_at = remaining.rfind(" ", 0, limit + 1)
         if split_at < limit // 3:
             split_at = limit
-        chunk = remaining[:split_at].rstrip()
+        raw_chunk = remaining[:split_at]
+        chunk = raw_chunk.rstrip()
         if not chunk:
             chunk = remaining[:limit]
             split_at = limit
-        chunks.append(chunk)
-        remaining = remaining[split_at:].lstrip()
+        chunk_end = start + len(chunk)
+        chunks.append(WireChunk(text=chunk, start=start, end=chunk_end))
+        start += split_at
+        while start < len(text) and text[start].isspace():
+            start += 1
     return chunks
 
 

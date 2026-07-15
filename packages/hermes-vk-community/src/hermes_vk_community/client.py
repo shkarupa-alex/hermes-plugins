@@ -2,9 +2,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import mimetypes
+import os
 import ssl
 import stat
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import urljoin
 
@@ -18,7 +22,6 @@ from hermes_vk_community.security import LONG_POLL_SUFFIXES, MEDIA_SUFFIXES, VkP
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
-    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -37,9 +40,12 @@ def _connector(resolver: VkPinnedResolver) -> aiohttp.TCPConnector:
 
 @dataclass(frozen=True, slots=True)
 class DownloadedMedia:
-    data: bytes
+    path: Path
     content_type: str
     final_url: str
+
+    def cleanup(self) -> None:
+        self.path.unlink(missing_ok=True)
 
 
 class VkApiClient:
@@ -153,14 +159,22 @@ class VkApiClient:
                     declared = response.content_length
                     if declared is not None and declared > self._media.max_download_bytes:
                         raise ValueError("VK media exceeds configured download limit")
-                    data = await _read_limited(response, self._media.max_download_bytes)
+                    path = await _stream_limited_to_temp(response, self._media.max_download_bytes)
                     content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
-                    return DownloadedMedia(data=data, content_type=content_type, final_url=current_url)
+                    return DownloadedMedia(path=path, content_type=content_type, final_url=current_url)
             finally:
                 await resolver.close()
         raise RuntimeError("unreachable VK media redirect state")
 
-    async def upload_file(self, url: str, field: str, path: Path, *, content_type: str | None = None) -> object:
+    async def upload_file(
+        self,
+        url: str,
+        field: str,
+        path: Path,
+        *,
+        content_type: str | None = None,
+        filename: str | None = None,
+    ) -> object:
         """Upload one local file to a VK-issued, pinned HTTPS endpoint without redirects."""
         validate_https_url(url, suffixes=MEDIA_SUFFIXES)
         try:
@@ -178,7 +192,7 @@ class VkApiClient:
         try:
             with path.open("rb") as handle:
                 form = aiohttp.FormData()
-                form.add_field(field, handle, filename=path.name, content_type=mime)
+                form.add_field(field, handle, filename=filename or path.name, content_type=mime)
                 async with (
                     aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as session,
                     session.post(url, data=form, allow_redirects=False) as response,
@@ -206,10 +220,23 @@ def parse_response(payload: object, response_type: type[T]) -> T:
     return TypeAdapter(response_type).validate_python(payload)
 
 
-async def _read_limited(response: aiohttp.ClientResponse, limit: int) -> bytes:
-    content = bytearray()
-    async for chunk in response.content.iter_chunked(64 * 1024):
-        content.extend(chunk)
-        if len(content) > limit:
-            raise ValueError("VK media exceeds configured download limit")
-    return bytes(content)
+async def _stream_limited_to_temp(response: aiohttp.ClientResponse, limit: int) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix="hermes-vk-download-")
+    path = Path(raw_path)
+    size = 0
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError("VK media exceeds configured download limit")  # noqa: TRY301
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(raw_path, 0o600)  # noqa: PTH101 - avoids blocking Path operation in async code
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(raw_path)  # noqa: PTH108 - avoids blocking Path operation in async code
+        raise
+    else:
+        return path

@@ -1,12 +1,12 @@
 from __future__ import annotations
 import asyncio
+import difflib
 import hashlib
 import logging
 import secrets
 import shutil
 import tempfile
 import time
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Never, cast
@@ -50,7 +50,7 @@ from hermes_vk_community.models import (
     VkKeyboard,
     VkUpdate,
 )
-from hermes_vk_community.renderer import PlainVkRenderer, split_message
+from hermes_vk_community.renderer import PlainVkRenderer, split_message, split_message_with_spans
 from hermes_vk_community.storage import InboxRecord, VkStorage
 from tools import slash_confirm
 
@@ -65,6 +65,7 @@ VK_TOO_LONG_ERROR = 914
 MIN_MESSAGE_LIMIT = 256
 MAX_APPROVAL_PREVIEW = 800
 MAX_PAIRING_TEXT = 128
+MAX_GEO_COORDINATES_LENGTH = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +143,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
             self._poll_task = asyncio.create_task(self._poll_loop(), name=f"vk-long-poll-{self.settings.group_id}")
             return True  # noqa: TRY300
         except (ValueError, VkApiError) as exc:
-            self._set_fatal_error("vk_identity_mismatch", str(exc), retryable=False)
+            message = _safe_api_error(exc) if isinstance(exc, VkApiError) else str(exc)[:512]
+            self._set_fatal_error("vk_identity_mismatch", message, retryable=False)
             logger.exception("[vk] permanent connection failure: %s", type(exc).__name__)
             await self._close_resources(release_lock=True)
             return False
@@ -169,7 +171,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 success=False, error="VK adapter is not connected", retryable=True, error_kind="transient"
             )
         rendered = self._renderer.render_markdown(content)
-        chunks = split_message(rendered.text, self._effective_limit)
+        wire_chunks = split_message_with_spans(rendered.text, self._effective_limit)
+        chunks = [chunk.text for chunk in wire_chunks]
         outbox = await self._storage.prepare_outbox(int(chat_id), chunks, reply_to)
         delivered: list[str] = []
         pending = list(zip(chunks, outbox, strict=True))
@@ -192,7 +195,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 delivered.append(message_id)
                 await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             except VkDeliveryUnknownError:
-                await self._storage.mark_outbox(record.id, "delivery_unknown", error="request timed out")
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    "delivery_unknown",
+                    "request timed out",
+                    [item[1] for item in pending[index + 1 :]],
+                    "blocked after ambiguous earlier chunk",
+                )
                 if delivered:
                     return _partial_result(delivered, [item[0] for item in pending])
                 return SendResult(
@@ -211,17 +220,29 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     pending[index : index + 1] = list(zip(replacement_chunks, replacement, strict=True))
                     continue
                 state = "partial_delivery" if delivered else "failed"
-                await self._storage.mark_outbox(record.id, state, error=str(exc))
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    state,
+                    _safe_api_error(exc),
+                    [item[1] for item in pending[index + 1 :]],
+                    "blocked after failed earlier chunk",
+                )
                 if delivered:
                     return _partial_result(delivered, [item[0] for item in pending])
                 return _api_error_result(exc)
             except Exception as exc:  # noqa: BLE001
-                await self._storage.mark_outbox(record.id, "delivery_unknown", error=type(exc).__name__)
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    "delivery_unknown",
+                    type(exc).__name__,
+                    [item[1] for item in pending[index + 1 :]],
+                    "blocked after ambiguous earlier chunk",
+                )
                 if delivered:
                     return _partial_result(delivered, [item[0] for item in pending])
                 return SendResult(
                     success=False,
-                    error="VK delivery failed after the request may have started",
+                    error="VK delivery timed out after the request may have started",
                     retryable=False,
                     error_kind="unknown",
                     raw_response={"delivery_unknown": True, "outbox_id": record.id},
@@ -282,13 +303,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 raw_response={"delivery_unknown": True, "outbox_id": record.id},
             )
         except VkApiError as exc:
-            await self._storage.mark_outbox(record.id, "failed", error=str(exc))
+            await self._storage.mark_outbox(record.id, "failed", error=_safe_api_error(exc))
             return _api_error_result(exc)
         except Exception as exc:  # noqa: BLE001 - the request may already have reached VK
             await self._storage.mark_outbox(record.id, "delivery_unknown", error=type(exc).__name__)
             return SendResult(
                 success=False,
-                error="VK delivery failed after the request may have started",
+                error="VK delivery timed out after the request may have started",
                 retryable=False,
                 error_kind="unknown",
                 raw_response={"delivery_unknown": True, "outbox_id": record.id},
@@ -297,7 +318,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
     async def _recover_prepared_outbox(self) -> None:
         if self._client is None or self._storage is None:
             return
-        for record in await self._storage.prepared_outbox():
+        records = await self._storage.prepared_outbox()
+        blocked_invocations: set[str] = set()
+        for record_index, record in enumerate(records):
+            if record.invocation_id in blocked_invocations:
+                continue
             await self._storage.mark_outbox(record.id, "sending")
             try:
                 response = await self._send_chunk(
@@ -310,9 +335,23 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 )
                 await self._storage.mark_outbox(record.id, "sent", message_id=_message_id(response))
             except VkDeliveryUnknownError:
-                await self._storage.mark_outbox(record.id, "delivery_unknown", error="recovery timed out")
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    "delivery_unknown",
+                    "recovery timed out",
+                    [item for item in records[record_index + 1 :] if item.invocation_id == record.invocation_id],
+                    "blocked after ambiguous recovery chunk",
+                )
+                blocked_invocations.add(record.invocation_id)
             except Exception as exc:  # noqa: BLE001 - recovery records terminal diagnostics
-                await self._storage.mark_outbox(record.id, "failed", error=type(exc).__name__)
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    "failed",
+                    type(exc).__name__,
+                    [item for item in records[record_index + 1 :] if item.invocation_id == record.invocation_id],
+                    "blocked after failed recovery chunk",
+                )
+                blocked_invocations.add(record.invocation_id)
 
     async def edit_message(
         self,
@@ -325,9 +364,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
         rendered = self._renderer.render_markdown(content)
-        chunks = split_message(rendered.text, self._effective_limit)
+        wire_chunks = split_message_with_spans(rendered.text, self._effective_limit)
+        chunks = [chunk.text for chunk in wire_chunks]
         if len(chunks) != 1 and not finalize:
             chunks = [rendered.text[: max(1, self._effective_limit - 2)].rstrip() + " …"]
+            wire_chunks = []
         try:
             await self._client.call(
                 "messages.edit",
@@ -349,11 +390,15 @@ class VkCommunityAdapter(BasePlatformAdapter):
         if len(chunks) == 1:
             return SendResult(success=True, message_id=message_id)
         continuation_ids: list[str] = []
-        delivered_wire = chunks[0]
-        for chunk in chunks[1:]:
+        delivered_rendered_end = wire_chunks[0].end
+        for chunk_index, chunk in enumerate(chunks[1:], start=1):
             result = await self.send(chat_id, chunk)
             if not result.success:
-                delivered_prefix = _source_prefix_for_rendered(self._renderer, content, delivered_wire)
+                delivered_prefix = _source_prefix_for_rendered(
+                    content,
+                    rendered.text,
+                    delivered_rendered_end,
+                )
                 return SendResult(
                     success=False,
                     error="overflow_continuation_failed",
@@ -375,7 +420,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             continuation_ids.extend(str(value) for value in raw_continuations)
             if result.message_id:
                 continuation_ids.append(result.message_id)
-            delivered_wire += chunk
+            delivered_rendered_end = wire_chunks[chunk_index].end
         return SendResult(
             success=True,
             message_id=continuation_ids[-1],
@@ -466,6 +511,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         group = secrets.token_urlsafe(12)
         rows: list[list[KeyboardButton]] = []
         now = time.monotonic()
+        self._interactions = {key: value for key, value in self._interactions.items() if value.expires_at >= now}
         for label, kind, value, target_id in buttons:
             nonce = secrets.token_urlsafe(24)
             payload = InteractionPayload.model_validate({"v": 1, "n": nonce}).model_dump_json(by_alias=True)
@@ -504,17 +550,17 @@ class VkCommunityAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
-        del metadata
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
+        downloaded = None
         try:
             downloaded = await self._client.download_media(image_url)
-            with tempfile.TemporaryDirectory(prefix="hermes-vk-upload-") as directory:
-                path = Path(directory) / "image"
-                path.write_bytes(downloaded.data)
-                return await self.send_image_file(chat_id, str(path), caption, reply_to)
-        except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"VK image upload failed: {type(exc).__name__}", retryable=False)
+            return await self.send_image_file(chat_id, str(downloaded.path), caption, reply_to)
+        except Exception:  # noqa: BLE001 - arbitrary public URLs use the base text fallback
+            return await BasePlatformAdapter.send_image(self, chat_id, image_url, caption, reply_to, metadata)
+        finally:
+            if downloaded is not None:
+                downloaded.cleanup()
 
     async def send_image_file(
         self,
@@ -571,14 +617,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         except Exception as voice_error:  # noqa: BLE001 - certified normal-document fallback below
             logger.warning("[vk] audio_message upload failed: %s", type(voice_error).__name__)
             try:
-                with tempfile.TemporaryDirectory(prefix="hermes-vk-voice-fallback-") as directory:
-                    archive = Path(directory) / f"{source.stem or 'voice'}.zip"
-                    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-                        bundle.write(source, arcname=source.name)
-                    attachment = await self._upload_document(int(chat_id), archive, file_name=archive.name)
-                    return await self._send_direct(
-                        int(chat_id), caption or "", reply_to=reply_to, attachment=attachment
-                    )
+                attachment = await self._upload_document(int(chat_id), source, file_name=source.name)
+                return await self._send_direct(int(chat_id), caption or "", reply_to=reply_to, attachment=attachment)
             except Exception as fallback_error:  # noqa: BLE001
                 return SendResult(
                     success=False,
@@ -590,14 +630,25 @@ class VkCommunityAdapter(BasePlatformAdapter):
         if self._client is None:
             raise RuntimeError("VK client is not connected")
         server = UploadServer.model_validate(
-            await self._client.call("photos.getMessagesUploadServer", {"peer_id": peer_id})
+            await self._safe_api_call("photos.getMessagesUploadServer", {"peer_id": peer_id})
         )
         mime = await asyncio.to_thread(_sniff_mime, path)
         if mime is None or not mime.startswith("image/"):
             raise ValueError("VK photo upload requires a sniffed image MIME type")
-        uploaded = PhotoUploadResponse.model_validate(
-            await self._client.upload_file(server.upload_url, "photo", path, content_type=mime)
-        )
+        extension = await asyncio.to_thread(_sniff_extension, path)
+        try:
+            uploaded = PhotoUploadResponse.model_validate(
+                await self._client.upload_file(
+                    server.upload_url,
+                    "photo",
+                    path,
+                    content_type=mime,
+                    filename=f"photo.{extension}" if extension else "photo",
+                )
+            )
+        except Exception as exc:
+            await self._record_orphan("photo-upload", peer_id, await asyncio.to_thread(_file_sha256, path), exc)
+            raise
         try:
             saved = TypeAdapter(list[SavedPhoto]).validate_python(
                 await self._client.call(
@@ -623,12 +674,25 @@ class VkCommunityAdapter(BasePlatformAdapter):
         if self._client is None:
             raise RuntimeError("VK client is not connected")
         server = UploadServer.model_validate(
-            await self._client.call("docs.getMessagesUploadServer", {"peer_id": peer_id, "type": upload_type})
+            await self._safe_api_call(
+                "docs.getMessagesUploadServer",
+                {"peer_id": peer_id, "type": upload_type},
+            )
         )
         mime = await asyncio.to_thread(_sniff_mime, path)
-        uploaded = DocumentUploadResponse.model_validate(
-            await self._client.upload_file(server.upload_url, "file", path, content_type=mime)
-        )
+        try:
+            uploaded = DocumentUploadResponse.model_validate(
+                await self._client.upload_file(
+                    server.upload_url,
+                    "file",
+                    path,
+                    content_type=mime,
+                    filename=file_name or path.name,
+                )
+            )
+        except Exception as exc:
+            await self._record_orphan("document-upload", peer_id, await asyncio.to_thread(_file_sha256, path), exc)
+            raise
         try:
             saved = SaveDocumentResponse.model_validate(
                 await self._client.call("docs.save", {"file": uploaded.file, "title": file_name or path.name})
@@ -646,6 +710,17 @@ class VkCommunityAdapter(BasePlatformAdapter):
             return
         fingerprint = hashlib.sha256(upload.encode()).hexdigest()
         await self._storage.record_media_orphan(kind, peer_id, fingerprint, type(error).__name__)
+
+    async def _safe_api_call(self, method: str, params: dict[str, object]) -> object:
+        if self._client is None:
+            raise RuntimeError("VK client is not connected")
+        retrying = AsyncRetrying(
+            retry=retry_if_exception(_is_retryable_safe_api_error),
+            wait=wait_random_exponential(multiplier=1, max=5),
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        return await retrying(self._client.call, method, params)
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         del metadata
@@ -799,7 +874,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
             parsed = self._renderer.parse_incoming(message.text, format_data)
             media_urls, media_types, is_voice, attachment_text = await self._cache_attachments(message.attachments)
             context = _structured_context(message.reply_message, message.fwd_messages)
-            text = "\n".join(part for part in (parsed.markdown, context, attachment_text) if part).strip()
+            geo_context = _geo_context(message.geo)
+            text = "\n".join(part for part in (parsed.markdown, context, attachment_text, geo_context) if part).strip()
             if not text and not media_urls:
                 await self._storage.mark_inbox(record.id, "quarantined", "empty message")
                 return
@@ -880,12 +956,16 @@ class VkCommunityAdapter(BasePlatformAdapter):
             url, filename, default_kind, voice = candidate
             try:
                 downloaded = await self._client.download_media(url)
-                cached = cache_media_bytes(
-                    downloaded.data,
-                    filename=filename,
-                    mime_type=downloaded.content_type,
-                    default_kind=default_kind,
-                )
+                try:
+                    data = await asyncio.to_thread(downloaded.path.read_bytes)
+                    cached = cache_media_bytes(
+                        data,
+                        filename=filename,
+                        mime_type=downloaded.content_type,
+                        default_kind=default_kind,
+                    )
+                finally:
+                    downloaded.cleanup()
             except Exception as exc:  # noqa: BLE001 - attachment failure must not drop the admitted text
                 logger.warning("[vk] attachment %s download failed: %s", attachment.type, type(exc).__name__)
                 descriptions.append(f"[{_attachment_description(attachment)}: загрузка не удалась]")
@@ -943,6 +1023,19 @@ def _sniff_mime(path: Path) -> str | None:
     return observed if isinstance(observed, str) else None
 
 
+def _sniff_extension(path: Path) -> str | None:
+    observed: object = filetype.guess_extension(str(path))  # pyright: ignore[reportUnknownMemberType]
+    return observed if isinstance(observed, str) else None
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 async def _convert_voice_to_ogg(source: Path, destination: Path, timeout_seconds: float) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -988,7 +1081,20 @@ def _api_error_result(exc: VkApiError) -> SendResult:
         914: ("too_long", False),
     }
     kind, retryable = mapping.get(exc.code, ("unknown", False))
-    return SendResult(success=False, error=str(exc), retryable=retryable, error_kind=kind)
+    return SendResult(success=False, error=_safe_api_error(exc), retryable=retryable, error_kind=kind)
+
+
+def _safe_api_error(exc: VkApiError) -> str:
+    messages = {
+        6: "VK rate limit was reached.",
+        7: "VK denied this operation.",
+        10: "VK reported a temporary internal error.",
+        14: "VK requires an interactive validation that community bots cannot complete.",
+        900: "VK denied access to this conversation.",
+        901: "VK cannot deliver messages to this user.",
+        914: "VK rejected the message because it is too long.",
+    }
+    return messages.get(exc.code, f"VK rejected the request (error {exc.code}).")
 
 
 def _partial_result(delivered: list[str], chunks: list[str]) -> SendResult:
@@ -1007,18 +1113,36 @@ def _partial_result(delivered: list[str], chunks: list[str]) -> SendResult:
     )
 
 
-def _source_prefix_for_rendered(renderer: PlainVkRenderer, source: str, delivered_wire: str) -> str:
-    """Return a literal source prefix whose plain rendering covers the visible wire prefix."""
-    low, high = 0, len(source)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if len(renderer.render_markdown(source[:middle]).text) <= len(delivered_wire):
-            low = middle
-        else:
-            high = middle - 1
-    while low < len(source) and source[low].isspace():
-        low += 1
-    return source[:low]
+def _source_prefix_for_rendered(source: str, rendered: str, rendered_end: int) -> str:
+    """Map a delivered rendered offset to a conservative literal source prefix."""
+    target = max(0, min(rendered_end, len(rendered)))
+    source_end = 0
+    for tag, source_start, source_stop, rendered_start, rendered_stop in difflib.SequenceMatcher(
+        None,
+        source,
+        rendered,
+        autojunk=False,
+    ).get_opcodes():
+        if rendered_start > target:
+            break
+        if tag == "delete":
+            if rendered_start <= target:
+                source_end = source_stop
+            continue
+        if target >= rendered_stop:
+            source_end = source_stop
+            continue
+        if tag == "equal":
+            source_end = source_start + max(0, target - rendered_start)
+        elif tag == "replace" and rendered_stop > rendered_start:
+            consumed = max(0, target - rendered_start)
+            source_width = source_stop - source_start
+            rendered_width = rendered_stop - rendered_start
+            source_end = source_start + min(source_width, consumed * source_width // rendered_width)
+        break
+    while source_end < len(source) and source[source_end].isspace():
+        source_end += 1
+    return source[:source_end]
 
 
 def _structured_context(reply: Mapping[str, object] | None, forwards: Sequence[Mapping[str, object]]) -> str:
@@ -1043,8 +1167,35 @@ def _attachment_description(attachment: VkAttachment) -> str:
         "video": "Видео",
         "sticker": "Стикер",
         "link": "Ссылка",
+        "poll": "Опрос",
+        "wall": "Запись на стене",
+        "article": "Статья",
     }
-    return labels.get(attachment.type, f"Вложение: {attachment.type}")
+    label = labels.get(attachment.type, f"Вложение: {attachment.type}")
+    payload = getattr(attachment, attachment.type, None)
+    if not isinstance(payload, dict):
+        return label
+    values = TypeAdapter(dict[str, object]).validate_python(payload)
+    title = values.get("title") or values.get("question")
+    text = values.get("text")
+    url = values.get("url") or values.get("player")
+    details = [str(value).strip()[:1000] for value in (title, text, url) if value]
+    return f"{label}: {' — '.join(details)}" if details else label
+
+
+def _geo_context(geo: Mapping[str, object] | None) -> str:
+    if not geo:
+        return ""
+    coordinates = geo.get("coordinates")
+    if isinstance(coordinates, dict):
+        values = TypeAdapter(dict[str, object]).validate_python(coordinates)
+        latitude = values.get("latitude")
+        longitude = values.get("longitude")
+        if isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
+            return f"[Геолокация: {latitude:.6f}, {longitude:.6f}]"
+    if isinstance(coordinates, str) and len(coordinates) <= MAX_GEO_COORDINATES_LENGTH:
+        return f"[Геолокация: {coordinates}]"
+    return "[Геолокация без распознанных координат]"
 
 
 def _attachment_candidate(attachment: VkAttachment) -> tuple[str, str, str, bool] | None:
@@ -1075,6 +1226,14 @@ def _raise_polling_resources_missing() -> Never:
 
 def _is_retryable_send_error(exc: BaseException) -> bool:
     return isinstance(exc, VkApiError) and exc.code in {6, 10}
+
+
+def _is_retryable_safe_api_error(exc: BaseException) -> bool:
+    if isinstance(exc, VkApiError):
+        return exc.code in {6, 10}
+    if isinstance(exc, VkHttpError):
+        return exc.status == HTTP_TOO_MANY_REQUESTS or exc.status >= HTTP_SERVER_ERROR_MIN
+    return isinstance(exc, (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ServerDisconnectedError, OSError))
 
 
 def _is_retryable_poll_error(exc: BaseException) -> bool:

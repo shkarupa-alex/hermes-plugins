@@ -1,4 +1,9 @@
-from hermes_vk_community.renderer import PlainVkRenderer, sanitize_incoming_text, split_message
+from hermes_vk_community.renderer import (
+    PlainVkRenderer,
+    sanitize_incoming_text,
+    split_message,
+    split_message_with_spans,
+)
 
 
 def test_plain_renderer_uses_ast_and_preserves_content() -> None:
@@ -27,3 +32,11 @@ def test_chunking_is_lossless_apart_from_boundary_whitespace() -> None:
     chunks = split_message("Первый абзац.\n\nВторой абзац длиннее.", 20)  # noqa: RUF001
     assert all(len(chunk) <= 20 for chunk in chunks)
     assert " ".join(" ".join(chunks).split()) == "Первый абзац. Второй абзац длиннее."
+
+
+def test_chunk_spans_track_removed_boundary_whitespace() -> None:
+    chunks = split_message_with_spans("first\n\nsecond", 7)
+    assert [(chunk.text, chunk.start, chunk.end) for chunk in chunks] == [
+        ("first", 0, 5),
+        ("second", 7, 13),
+    ]

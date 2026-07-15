@@ -2,6 +2,8 @@ name: Release gates
 
 on:
   workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 jobs:
   cpu-session-audit:
@@ -20,7 +22,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/hermes-profile"
-          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n' > "$RUNNER_TEMP/hermes-profile/config.yaml"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$RUNNER_TEMP/hermes-profile" > "$RUNNER_TEMP/hermes-profile/config.yaml"
           echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
       - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
       - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
@@ -37,10 +39,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
+      - name: Configure and fetch the pinned default pipeline
+        run: |
+          mkdir -p "$RUNNER_TEMP/hermes-profile"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$RUNNER_TEMP/hermes-profile" > "$RUNNER_TEMP/hermes-profile/config.yaml"
+          echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
       - name: Require versioned Russian corpus artifact
         run: test -f release-corpus/manifest.jsonl
       - run: test -f release-corpus/baseline.json
-      - run: uv run python tools/asr_corpus_gate.py release-corpus/manifest.jsonl --baseline release-corpus/baseline.json
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
+      - run: uv run python tools/asr_corpus_gate.py release-corpus/manifest.jsonl --baseline release-corpus/baseline.json --output release-corpus/result.json
+      - name: Preserve corpus metrics
+        if: ${{ always() && hashFiles('release-corpus/result.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: asr-corpus-result
+          path: release-corpus/result.json
 
   advertised-model-smoke:
     strategy:
@@ -69,7 +84,6 @@ jobs:
       - run: uv run --package hermes-onnx-asr hermes onnx-asr warmup
 
   vk-live:
-    if: ${{ secrets.VK_COMMUNITY_TOKEN != '' && secrets.VK_GROUP_ID != '' && secrets.VK_TEST_PEER_ID != '' }}
     runs-on: ubuntu-latest
     env:
       VK_COMMUNITY_TOKEN: ${{ secrets.VK_COMMUNITY_TOKEN }}
@@ -79,4 +93,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
+      - name: Require private VK release-test credentials
+        shell: bash
+        run: test -n "$VK_COMMUNITY_TOKEN" && test -n "$VK_GROUP_ID" && test -n "$VK_TEST_PEER_ID"
       - run: uv run pytest -q -m vk_live

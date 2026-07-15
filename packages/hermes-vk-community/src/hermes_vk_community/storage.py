@@ -125,6 +125,7 @@ class VkStorage:
     async def open(self) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
+        self.path.chmod(0o600)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA synchronous=FULL")
@@ -411,6 +412,39 @@ class VkStorage:
             (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
         )
         await db.commit()
+
+    async def terminalize_outbox_failure(
+        self,
+        record: OutboxRecord,
+        state: str,
+        error: str,
+        tail_records: list[OutboxRecord],
+        tail_error: str,
+    ) -> None:
+        """Atomically terminate a failed chunk and every later prepared chunk."""
+        db = self._connection()
+        now = _now_ms()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute(
+                "UPDATE outbox SET state=?,error=?,updated_at_ms=? WHERE id=?",
+                (state, (error or "delivery failed")[:2048], now, record.id),
+            )
+            if tail_records:
+                placeholders = ",".join("?" for _ in tail_records)
+                await db.execute(
+                    f"UPDATE outbox SET state='failed',error=?,updated_at_ms=? "  # noqa: S608 - IDs use placeholders
+                    f"WHERE state='prepared' AND id IN ({placeholders})",
+                    (
+                        (tail_error or "unsent tail is terminal")[:2048],
+                        now,
+                        *(item.id for item in tail_records),
+                    ),
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
 
     async def counts(self) -> dict[str, int]:
         db = self._connection()

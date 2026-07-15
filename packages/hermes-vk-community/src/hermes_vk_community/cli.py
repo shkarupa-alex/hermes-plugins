@@ -187,7 +187,7 @@ async def _create_pairing_code(ttl: int | None) -> int:
     if not MIN_PAIRING_TTL <= effective_ttl <= MAX_PAIRING_TTL:
         print("Pairing TTL must be between 60 and 86400 seconds")
         return 1
-    code = "VK-" + secrets.token_hex(4).upper()
+    code = "VK-" + secrets.token_hex(16).upper()
     storage = VkStorage(settings.resolve_storage_path(Path(get_hermes_home())))
     try:
         await storage.open()

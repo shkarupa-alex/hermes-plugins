@@ -112,6 +112,25 @@ async def test_nonrecoverable_outbox_is_not_replayed_as_plain_text(tmp_path: Pat
     await reopened.close()
 
 
+@pytest.mark.asyncio
+async def test_terminalized_outbox_tail_is_not_recovered(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "vk.sqlite3")
+    await storage.open()
+    records = await storage.prepare_outbox(2, ["first", "second", "third"], None)
+    await storage.terminalize_outbox_failure(
+        records[0],
+        "delivery_unknown",
+        "request timed out",
+        records[1:],
+        "blocked by ambiguous prefix",
+    )
+    assert await storage.prepared_outbox() == []
+    db = storage._connection()
+    async with db.execute("SELECT state FROM outbox ORDER BY id") as cursor:
+        assert [row[0] for row in await cursor.fetchall()] == ["delivery_unknown", "failed", "failed"]
+    await storage.close()
+
+
 def test_canonical_json_keeps_unicode_and_order_is_stable() -> None:
     encoded = canonical_json({"б": "😀", "a": 1})  # noqa: RUF001
     assert encoded == '{"a":1,"б":"😀"}'  # noqa: RUF001

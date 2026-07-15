@@ -10,9 +10,12 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_vk_community.adapter import (
     VkCommunityAdapter,
     _attachment_candidate,
+    _attachment_description,
+    _geo_context,
     _Interaction,
     _is_retryable_poll_error,
     _is_retryable_send_error,
+    _source_prefix_for_rendered,
 )
 from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError
 from hermes_vk_community.models import InteractionPayload, VkAttachment, VkMessage
@@ -105,6 +108,25 @@ def test_audio_message_prefers_ogg_and_marks_voice() -> None:
     )
 
 
+def test_non_downloadable_attachments_preserve_useful_context() -> None:
+    poll = VkAttachment.model_validate({"type": "poll", "poll": {"question": "Куда идём?"}})
+    article = VkAttachment.model_validate(
+        {
+            "type": "article",
+            "article": {"title": "Новости", "url": "https://vk.com/@example-news"},
+        }
+    )
+    assert _attachment_description(poll) == "Опрос: Куда идём?"
+    assert _attachment_description(article) == "Статья: Новости — https://vk.com/@example-news"
+
+
+def test_geo_context_handles_structured_and_unrecognized_coordinates() -> None:
+    assert _geo_context({"coordinates": {"latitude": 55.7558, "longitude": 37.6173}}) == (
+        "[Геолокация: 55.755800, 37.617300]"
+    )
+    assert _geo_context({"place": {"title": "Москва"}}) == ("[Геолокация без распознанных координат]")
+
+
 def test_retries_only_definitely_rejected_send_attempts() -> None:
     assert _is_retryable_send_error(VkApiError(6, "too many requests"))
     assert _is_retryable_send_error(VkApiError(10, "internal error"))
@@ -174,7 +196,13 @@ async def test_mixed_attachments_expose_only_voice_to_stt(monkeypatch: pytest.Mo
 
     class DownloadClient:
         async def download_media(self, url: str) -> SimpleNamespace:
-            return SimpleNamespace(data=url.encode(), content_type="application/octet-stream")
+            path = tmp_path / f"download-{abs(hash(url))}"
+            path.write_bytes(url.encode())
+            return SimpleNamespace(
+                path=path,
+                content_type="application/octet-stream",
+                cleanup=lambda: path.unlink(missing_ok=True),
+            )
 
     cached_index = 0
 
@@ -229,3 +257,61 @@ async def test_error_914_progressively_reduces_and_caches_limit(tmp_path: Path) 
         assert client.lengths == [1000, 500, 500]
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_chunk_makes_unsent_tail_terminal(tmp_path: Path) -> None:
+    adapter = _adapter()
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+
+    class FailingClient:
+        async def call(self, _method: str, _params: dict[str, object]) -> object:
+            raise VkApiError(7, "permission denied")
+
+    adapter._storage = storage
+    adapter._client = cast("VkApiClient", FailingClient())
+    try:
+        result = await adapter.send("456", "x" * 5000)
+        assert not result.success
+        assert await storage.prepared_outbox() == []
+        db = storage._connection()
+        async with db.execute("SELECT state FROM outbox ORDER BY id") as cursor:
+            states = [row[0] for row in await cursor.fetchall()]
+        assert states[0] == "failed"
+        assert set(states[1:]) == {"failed"}
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_stops_after_earlier_chunk_failure(tmp_path: Path) -> None:
+    adapter = _adapter()
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    await storage.prepare_outbox(456, ["one", "two"], None)
+
+    class FailingClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def call(self, _method: str, params: dict[str, object]) -> object:
+            self.calls.append(str(params["message"]))
+            raise VkApiError(7, "permission denied")
+
+    client = FailingClient()
+    adapter._storage = storage
+    adapter._client = cast("VkApiClient", client)
+    try:
+        await adapter._recover_prepared_outbox()
+        assert client.calls == ["one"]
+        assert await storage.prepared_outbox() == []
+    finally:
+        await storage.close()
+
+
+def test_stream_recovery_maps_rendered_bold_span_without_duplicate_text() -> None:
+    source = "**" + "x" * 5000 + "**"
+    prefix = _source_prefix_for_rendered(source, "x" * 5000, 4096)
+    assert prefix == "**" + "x" * 4096
+    assert source[len(prefix) :].count("x") == 904
