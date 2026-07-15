@@ -5,6 +5,7 @@ import pytest
 
 from hermes_vk_community.errors import VkSecurityError
 from hermes_vk_community.security import (
+    MEDIA_SUFFIXES,
     VkPinnedResolver,
     canonical_host,
     host_matches,
@@ -16,6 +17,14 @@ from hermes_vk_community.security import (
 def test_label_aware_suffix_matching() -> None:
     assert host_matches("lp.vk.com", ("vk.com",))
     assert not host_matches("evilvk.com", ("vk.com",))
+
+
+def test_live_vk_voice_cdn_is_approved_without_suffix_confusion() -> None:
+    assert validate_https_url("https://psv4.vkuserphoto.ru/voice.ogg", suffixes=MEDIA_SUFFIXES) == (
+        "psv4.vkuserphoto.ru"
+    )
+    with pytest.raises(VkSecurityError, match="not approved"):
+        validate_https_url("https://psv4.vkuserphoto.ru.attacker.invalid/voice.ogg", suffixes=MEDIA_SUFFIXES)
 
 
 @pytest.mark.parametrize(
