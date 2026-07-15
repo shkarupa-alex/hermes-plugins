@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
@@ -37,7 +37,7 @@ jobs:
         os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15-arm64]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -60,7 +60,7 @@ jobs:
   asr-corpus:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
       - name: Configure and fetch the pinned default pipeline
@@ -107,7 +107,7 @@ jobs:
           - {model: whisper-base, quantization: int8}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
       - name: Configure model profile
@@ -127,7 +127,7 @@ jobs:
       VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
       VK_TEST_PEER_ID: ${{ secrets.VK_TEST_PEER_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --all-packages --locked
       - name: Require private VK release-test credentials
