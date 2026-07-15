@@ -34,6 +34,8 @@ jobs:
             --ignore-vuln PYSEC-2026-2257
       - name: Scan repository history for secrets
         uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   quality:
     runs-on: ubuntu-latest
