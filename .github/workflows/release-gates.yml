@@ -10,10 +10,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v8
       - name: Audit locked production dependencies
         run: |
           uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
@@ -28,7 +28,7 @@ jobs:
             --ignore-vuln PYSEC-2026-2256 \
             --ignore-vuln PYSEC-2026-2257
       - name: Scan repository history for secrets
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
 
   cpu-session-audit:
     strategy:
@@ -37,17 +37,18 @@ jobs:
         os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15-arm64]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
       - run: uv sync --all-packages --locked
       - name: Configure isolated Hermes profile
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/hermes-profile"
-          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$RUNNER_TEMP/hermes-profile" > "$RUNNER_TEMP/hermes-profile/config.yaml"
-          echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
+          profile_root="${RUNNER_TEMP//\\//}/hermes-profile"
+          mkdir -p "$profile_root"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$profile_root" > "$profile_root/config.yaml"
+          echo "HERMES_HOME=$profile_root" >> "$GITHUB_ENV"
       - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
       - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
       - run: uv run --package hermes-onnx-asr hermes onnx-asr doctor
@@ -60,14 +61,17 @@ jobs:
   asr-corpus:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
       - run: uv sync --all-packages --locked
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
       - name: Configure and fetch the pinned default pipeline
         run: |
-          mkdir -p "$RUNNER_TEMP/hermes-profile"
-          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$RUNNER_TEMP/hermes-profile" > "$RUNNER_TEMP/hermes-profile/config.yaml"
-          echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
+          profile_root="${RUNNER_TEMP//\\//}/hermes-profile"
+          mkdir -p "$profile_root"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$profile_root" > "$profile_root/config.yaml"
+          echo "HERMES_HOME=$profile_root" >> "$GITHUB_ENV"
       - name: Require versioned Russian corpus artifact
         run: test -f release-corpus/manifest.jsonl
       - run: test -f release-corpus/baseline.json
@@ -107,16 +111,17 @@ jobs:
           - {model: whisper-base, quantization: int8}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
       - run: uv sync --all-packages --locked
       - name: Configure model profile
         run: |
-          mkdir -p "$RUNNER_TEMP/hermes-profile"
+          profile_root="${RUNNER_TEMP//\\//}/hermes-profile"
+          mkdir -p "$profile_root"
           config_quantization="${{ matrix.quantization }}"
           if [ "$config_quantization" = fp32 ]; then config_quantization=null; fi
-          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: ${{ matrix.model }}\n    quantization: %s\n    model_dir: "%s/models/onnx-asr"\n    vad:\n      min_audio_seconds: null\n' "$config_quantization" "$RUNNER_TEMP/hermes-profile" > "$RUNNER_TEMP/hermes-profile/config.yaml"
-          echo "HERMES_HOME=$RUNNER_TEMP/hermes-profile" >> "$GITHUB_ENV"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: ${{ matrix.model }}\n    quantization: %s\n    model_dir: "%s/models/onnx-asr"\n    vad:\n      min_audio_seconds: null\n' "$config_quantization" "$profile_root" > "$profile_root/config.yaml"
+          echo "HERMES_HOME=$profile_root" >> "$GITHUB_ENV"
       - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "${{ matrix.model }}" --quantization "${{ matrix.quantization }}"
       - run: uv run --package hermes-onnx-asr hermes onnx-asr warmup
 
@@ -127,8 +132,8 @@ jobs:
       VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
       VK_TEST_PEER_ID: ${{ secrets.VK_TEST_PEER_ID }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
       - run: uv sync --all-packages --locked
       - name: Require private VK release-test credentials
         shell: bash
