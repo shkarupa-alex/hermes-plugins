@@ -1,5 +1,4 @@
 from __future__ import annotations
-import base64
 import json
 import os
 import secrets
@@ -8,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
+from PIL import Image
 from pydantic import TypeAdapter
 
 from hermes_vk_community.client import VkApiClient
@@ -18,10 +18,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from hermes_vk_community.adapter import VkCommunityAdapter
-
-PNG_1X1 = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-)
 
 
 def _credentials() -> tuple[str, int, int]:
@@ -65,6 +61,10 @@ def _mapping(value: object) -> dict[str, object] | None:
     return cast("dict[str, object]", value) if isinstance(value, dict) else None
 
 
+def _dimension(value: object) -> int:
+    return value if isinstance(value, int) else 0
+
+
 def _latest_incoming_message_id(history: object, peer_id: int) -> int:
     if not isinstance(history, dict):
         raise TypeError("messages.getHistory returned no object")
@@ -95,13 +95,17 @@ def _photo_url(message: dict[str, object]) -> str:
         sizes = photo.get("sizes")
         if not isinstance(sizes, list):
             continue
-        urls = [
-            cast("str", size["url"])
+        candidates = [
+            size
             for raw_size in cast("list[object]", sizes)
             if (size := _mapping(raw_size)) is not None and isinstance(size.get("url"), str)
         ]
-        if urls:
-            return urls[-1]
+        if candidates:
+            largest = max(
+                candidates,
+                key=lambda size: _dimension(size.get("width")) * _dimension(size.get("height")),
+            )
+            return cast("str", largest["url"])
     raise AssertionError("VK message contains no downloadable photo")
 
 
@@ -258,7 +262,7 @@ async def test_vk_live_photo_upload_and_visible_delivery(tmp_path: Path) -> None
     adapter._client = client  # pyright: ignore[reportPrivateUsage]
     adapter._storage = storage  # pyright: ignore[reportPrivateUsage]
     image = tmp_path / "release-test.png"
-    image.write_bytes(PNG_1X1)
+    Image.new("RGB", (64, 64), color=(51, 102, 153)).save(image)
     result = None
     downloaded = None
     try:
