@@ -1,4 +1,6 @@
+# ruff: noqa: RUF001
 from __future__ import annotations
+import platform
 from typing import Any, cast
 
 from hermes_cli.config import read_raw_config, save_config
@@ -63,7 +65,10 @@ def _select_model() -> str:
 def _select_quantization(model: str) -> str | None:
     supported_quantizations = model_entry(model).quantizations
     if len(supported_quantizations) > 1:
-        raw_quantization = prompt("Квантование (int8 или fp32)", default="int8").strip().lower()
+        default_quantization, guidance = _quantization_guidance()
+        for line in guidance:
+            print_info(line)
+        raw_quantization = prompt("Квантование (int8 или fp32)", default=default_quantization).strip().lower()
         quantization = None if raw_quantization in {"fp32", "none"} else raw_quantization
         if quantization not in supported_quantizations:
             raise ValueError(f"Неподдерживаемое квантование для {model}: {raw_quantization}")
@@ -71,6 +76,50 @@ def _select_quantization(model: str) -> str | None:
     only = supported_quantizations[0]
     print_info(f"Для {model} доступно только {only or 'fp32'}.")
     return only
+
+
+def _quantization_guidance() -> tuple[str, tuple[str, ...]]:
+    machine = platform.machine().lower()
+    system = platform.system().lower()
+    size_hint = "Для GigaAM v3 E2E RNN-T: около 0,9 ГБ fp32 против 0,23 ГБ int8."
+    if machine in {"x86_64", "amd64"}:
+        return (
+            "fp32",
+            (
+                "Подсказка для x86-64/Ryzen: начните с fp32, если хватает RAM; int8 выбирайте ради экономии памяти.",
+                "В upstream CPU-бенчмарке этой модели скорость fp32/int8 почти одинакова; "
+                "на старых CPU int8 может быть медленнее.",
+                size_hint,
+            ),
+        )
+    if system == "darwin" and machine in {"arm64", "aarch64"}:
+        return (
+            "fp32",
+            (
+                "Подсказка для Apple Silicon: при CPUExecutionProvider начните с fp32; "
+                "ускорение int8 не гарантировано.",
+                "Выбирайте int8, если важнее экономия памяти, и сравните качество на своей записи.",
+                size_hint,
+            ),
+        )
+    if machine in {"arm64", "aarch64", "armv7l", "armv8l"}:
+        return (
+            "int8",
+            (
+                "Подсказка для ARM: начните с int8 ради меньшего расхода памяти; "
+                "выигрыш скорости зависит от dot-product инструкций CPU.",
+                "Если качество хуже ожидаемого и памяти достаточно, повторите setup с fp32.",
+                size_hint,
+            ),
+        )
+    return (
+        "int8",
+        (
+            "Подсказка: int8 экономит память, но не на каждом CPU быстрее fp32 и может немного менять точность.",
+            "При достаточной RAM сравните оба варианта на одной записи; повторный setup безопасен.",
+            size_hint,
+        ),
+    )
 
 
 def _select_vad_threshold() -> float | None:
