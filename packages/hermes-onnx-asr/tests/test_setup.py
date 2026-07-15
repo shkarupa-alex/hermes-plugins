@@ -57,6 +57,30 @@ def test_t_one_picker_uses_its_only_supported_fp32(monkeypatch: pytest.MonkeyPat
     assert setup._select_quantization("t-tech/t-one") is None
 
 
+@pytest.mark.parametrize(
+    ("system", "machine", "expected"),
+    [
+        ("Linux", "x86_64", "fp32"),
+        ("Darwin", "arm64", "fp32"),
+        ("Linux", "aarch64", "int8"),
+        ("Linux", "riscv64", "int8"),
+    ],
+)
+def test_quantization_guidance_uses_safe_platform_default(
+    monkeypatch: pytest.MonkeyPatch,
+    system: str,
+    machine: str,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(setup.platform, "system", lambda: system)
+    monkeypatch.setattr(setup.platform, "machine", lambda: machine)
+    default, guidance = setup._quantization_guidance()
+    assert default == expected
+    combined = " ".join(guidance)
+    assert "int8" in combined
+    assert "fp32" in combined
+
+
 def test_model_picker_rejects_upstream_model_pending_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
     def ignore(_message: str) -> None:
         pass
