@@ -179,6 +179,7 @@ class FormattingProbeCase(VkModel):
     request_message: str
     request_length: int | None = None
     request_sha256: str | None = None
+    request_format_data: JsonObject | None = None
     send_status: str
     readback_text: str | None = None
     readback_length: int | None = None
@@ -212,6 +213,11 @@ class VkCapabilityProfile(VkModel):
     rich_edit: bool
     format_data_observed: bool
     send_limit: int
+    edit_limit: int
+    offset_unit: Literal["unicode_codepoints", "unverified"]
+    nested_ranges: Literal["properly_nested"]
+    overlapping_ranges: Literal["accepted_transport_inbound_plain_fallback"]
+    supported_format_types: list[Literal["bold", "italic", "underline", "url"]]
     typing_indicator_visible: bool
     observations: dict[str, str]
     clients: list[CapabilityClient]

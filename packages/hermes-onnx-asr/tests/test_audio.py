@@ -12,12 +12,12 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def write_wav(path: Path, *, seconds: float = 1, channels: int = 2) -> None:
+def write_wav(path: Path, *, seconds: float = 1, channels: int = 2, sample_rate: int = 16_000) -> None:
     with wave.open(str(path), "wb") as audio:
         audio.setnchannels(channels)
         audio.setsampwidth(2)
-        audio.setframerate(16_000)
-        audio.writeframes(b"\0\0" * channels * int(16_000 * seconds))
+        audio.setframerate(sample_rate)
+        audio.writeframes(b"\0\0" * channels * int(sample_rate * seconds))
 
 
 def test_pcm_wav_uses_direct_path_and_header_duration(tmp_path: Path) -> None:
@@ -25,6 +25,12 @@ def test_pcm_wav_uses_direct_path_and_header_duration(tmp_path: Path) -> None:
     write_wav(source, seconds=1.25)
     assert is_compatible_pcm_wav(source) is True
     assert wav_duration(source) == pytest.approx(1.25)
+
+
+def test_pcm_wav_with_unsupported_sample_rate_requires_normalization(tmp_path: Path) -> None:
+    source = tmp_path / "unsupported-rate.wav"
+    write_wav(source, sample_rate=12_000)
+    assert is_compatible_pcm_wav(source) is False
 
 
 def test_optional_duration_limit(tmp_path: Path) -> None:

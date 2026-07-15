@@ -38,6 +38,11 @@ def test_cpu_provider_is_not_user_configurable() -> None:
         OnnxAsrSettings(providers=["CoreMLExecutionProvider"])  # type: ignore[call-arg]
 
 
+def test_t_one_uses_its_only_supported_quantization_when_not_explicit() -> None:
+    assert OnnxAsrSettings(model="t-tech/t-one").quantization is None
+    assert OnnxAsrSettings(model="t-tech/t-one", quantization="int8").quantization == "int8"
+
+
 def test_pydantic_settings_nested_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_ONNX_ASR__VAD__MIN_AUDIO_SECONDS", "0")
     assert OnnxAsrSettings().vad.min_audio_seconds == 0

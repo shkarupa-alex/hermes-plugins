@@ -113,6 +113,8 @@ class OnnxAsrSettings(BaseSettings):
     def normalize(self) -> Self:
         if not self.model.strip():
             raise ValueError("model must not be empty")
+        if self.model == "t-tech/t-one" and "quantization" not in self.model_fields_set:
+            self.quantization = None
         if self.quantization is not None and not self.quantization.strip():
             self.quantization = None
         self.model_dir = self.model_dir.expanduser()

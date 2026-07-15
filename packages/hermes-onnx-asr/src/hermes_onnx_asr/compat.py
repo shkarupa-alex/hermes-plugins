@@ -8,6 +8,10 @@ from packaging.version import Version
 
 MIN_HERMES = Version("0.18.2")
 MAX_HERMES = Version("0.19")
+MIN_ONNX_ASR = Version("0.12.0")
+MAX_ONNX_ASR = Version("0.13")
+MIN_ONNXRUNTIME = Version("1.23.2")
+MAX_ONNXRUNTIME = Version("1.24")
 
 
 EXPECTED_TRANSCRIBE_SHAPE = (
@@ -51,6 +55,8 @@ def check_requirements() -> bool:
     if not compatible:
         return False
     try:
-        return version("onnx-asr") == "0.11.0" and version("onnxruntime") == "1.23.2"
+        onnx_asr_version = Version(version("onnx-asr"))
+        runtime_version = Version(version("onnxruntime"))
     except PackageNotFoundError:
         return False
+    return MIN_ONNX_ASR <= onnx_asr_version < MAX_ONNX_ASR and MIN_ONNXRUNTIME <= runtime_version < MAX_ONNXRUNTIME

@@ -87,14 +87,20 @@ class VkPinnedResolver(AbstractResolver):
         port: int = 0,
         family: socket.AddressFamily = socket.AF_UNSPEC,
     ) -> list[ResolveResult]:
-        canonical = canonical_host(host)
+        try:
+            canonical = canonical_host(host)
+        except (ValueError, VkSecurityError) as exc:
+            raise OSError("invalid resolver host") from exc
         if not host_matches(canonical, self._suffixes):
             raise OSError(f"host {canonical!r} is not approved")
         loop = asyncio.get_running_loop()
         records = await loop.getaddrinfo(canonical, port, family=family, type=socket.SOCK_STREAM)
         results: list[ResolveResult] = []
         for record_family, _socktype, _proto, _canonname, sockaddr in records:
-            numeric = validate_global_address(str(sockaddr[0]))
+            try:
+                numeric = validate_global_address(str(sockaddr[0]))
+            except (ValueError, VkSecurityError) as exc:
+                raise OSError(f"host {canonical!r} resolved to a prohibited address") from exc
             results.append(
                 ResolveResult(
                     hostname=canonical,

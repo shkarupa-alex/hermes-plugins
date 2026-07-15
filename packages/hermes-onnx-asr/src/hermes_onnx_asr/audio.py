@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 MAX_STDERR_BYTES = 65_536
 NORMALIZED_BYTES_PER_SECOND = 16_000 * 2
 MIN_WAV_BYTES = 44
+SUPPORTED_SAMPLE_RATES = frozenset({8_000, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000})
 
 
 class _ProbeStream(BaseModel):
@@ -50,7 +51,11 @@ def wav_duration(path: Path) -> float:
 def is_compatible_pcm_wav(path: Path) -> bool:
     try:
         with wave.open(str(path), "rb") as audio:
-            return audio.getcomptype() == "NONE" and audio.getsampwidth() in {1, 2, 3, 4} and audio.getframerate() > 0
+            return (
+                audio.getcomptype() == "NONE"
+                and audio.getsampwidth() in {1, 2, 3, 4}
+                and audio.getframerate() in SUPPORTED_SAMPLE_RATES
+            )
     except (OSError, wave.Error):
         return False
 

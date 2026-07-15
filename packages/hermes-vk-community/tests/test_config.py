@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from hermes_vk_community import adapter
+from hermes_vk_community.capabilities import rich_capability_ready
 from hermes_vk_community.config import PolicyEnvironment, apply_yaml_config, settings_from_platform_config
 
 
@@ -60,12 +61,15 @@ def test_policy_environment_reports_only_active_conflicts(monkeypatch: pytest.Mo
     assert PolicyEnvironment().conflicts() == ["GATEWAY_ALLOWED_USERS", "VK_ALLOW_ALL_USERS"]
 
 
-def test_rich_mode_requires_probe_profile() -> None:
+def test_live_certified_profile_enables_rich_mode() -> None:
     result = apply_yaml_config(
         {},
         {"group_id": 1, "allowed_user_ids": [2], "formatting": {"mode": "rich"}},
     )
-    assert "capability profile" in result["_vk_validation_errors"][0]
+    assert result["_vk_validation_errors"] == []
+    assert result["formatting"]["mode"] == "rich"
+    assert result["formatting"]["table_style"] == "jpeg"
+    assert rich_capability_ready("5.199")
 
 
 def test_runtime_never_reads_vk_token_with_os_getenv() -> None:

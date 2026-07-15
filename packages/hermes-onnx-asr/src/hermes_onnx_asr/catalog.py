@@ -14,6 +14,7 @@ from typing import Literal, get_args
 
 from filelock import FileLock
 from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
+from packaging.version import Version
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from hermes_onnx_asr.errors import OnnxAsrError, safe_error
@@ -32,6 +33,7 @@ class CatalogEntry(BaseModel):
     files: dict[str, list[str]]
     download: Literal["huggingface_snapshot"]
     certified: bool = False
+    requires_config: bool = True
 
     @field_validator("revision")
     @classmethod
@@ -76,12 +78,15 @@ class BundleManifest(BaseModel):
 def load_catalog() -> Catalog:
     resource = files("hermes_onnx_asr").joinpath("data/catalog.json")
     catalog = Catalog.model_validate_json(resource.read_text(encoding="utf-8"))
+    installed = Version(version("onnx-asr"))
+    minimum = Version(catalog.onnx_asr_version)
+    if installed < minimum:
+        raise RuntimeError(f"onnx-asr {installed} is below the catalog minimum {minimum}")
     upstream = set(upstream_model_names())
-    bundled = {entry.alias for entry in catalog.models}
-    if bundled != upstream:
-        missing = ", ".join(sorted(upstream - bundled)) or "none"
-        stale = ", ".join(sorted(bundled - upstream)) or "none"
-        raise RuntimeError(f"ONNX ASR catalog mismatch; missing: {missing}; stale: {stale}")
+    unavailable_certified = {entry.alias for entry in catalog.models if entry.certified and entry.alias not in upstream}
+    if unavailable_certified:
+        names = ", ".join(sorted(unavailable_certified))
+        raise RuntimeError(f"certified ONNX ASR models disappeared from the upstream registry: {names}")
     return catalog
 
 
@@ -102,8 +107,31 @@ def model_entry(alias: str) -> CatalogEntry:
     raise safe_error("model_not_in_catalog")
 
 
+def catalog_model_entries() -> tuple[CatalogEntry, ...]:
+    upstream = set(upstream_model_names())
+    return tuple(entry for entry in load_catalog().models if entry.alias in upstream)
+
+
 def certified_model_names() -> tuple[str, ...]:
-    return tuple(entry.alias for entry in load_catalog().models if entry.certified)
+    return tuple(entry.alias for entry in catalog_model_entries() if entry.certified)
+
+
+def model_languages(alias: str) -> list[str]:
+    if alias in {
+        "gigaam-multilingual-ctc",
+        "gigaam-multilingual-large-ctc",
+        "nemo-parakeet-tdt-0.6b-v3",
+        "nemo-canary-1b-v2",
+        "whisper-base",
+    }:
+        return ["multilingual"]
+    if alias in {
+        "nemo-parakeet-ctc-0.6b",
+        "nemo-parakeet-rnnt-0.6b",
+        "nemo-parakeet-tdt-0.6b-v2",
+    }:
+        return ["en"]
+    return ["ru"]
 
 
 def catalog_entry(alias: str, quantization: str | None, *, kind: Literal["model", "vad"] = "model") -> CatalogEntry:
@@ -230,16 +258,22 @@ def verify_bundle(
         raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
     identity = (manifest.kind, manifest.alias, manifest.quantization, manifest.repository, manifest.revision)
     expected = (kind, alias, quantization, entry.repository, entry.revision)
-    if identity != expected or manifest.onnx_asr_version != load_catalog().onnx_asr_version:
+    if identity != expected or manifest.onnx_asr_version != version("onnx-asr"):
         raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
     actual = _inventory(directory)
     if actual != manifest.files:
+        raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
+    if (
+        kind == "model"
+        and entry.requires_config
+        and not any((directory / name).is_file() for name in ("config.json", "config.yaml"))
+    ):
         raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
     for pattern in _expected_patterns(alias, quantization, kind):
         if pattern in {"config.json", "config.yaml"} or ".onnx?data" in pattern:
             continue
         matches = list(directory.glob(pattern))
-        if not matches and not pattern.endswith(".data"):
+        if not matches:
             raise safe_error("model_not_installed" if kind == "model" else "vad_not_installed")
     return manifest
 

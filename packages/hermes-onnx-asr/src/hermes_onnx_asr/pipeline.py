@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 import onnx_asr
 import onnxruntime as ort
 
-from hermes_onnx_asr.catalog import bundle_path, fetch_bundle, verify_bundle
+from hermes_onnx_asr.catalog import bundle_path, fetch_bundle, model_languages, verify_bundle
 from hermes_onnx_asr.errors import OnnxAsrError, safe_error
 
 if TYPE_CHECKING:
@@ -30,6 +30,8 @@ MODEL_SESSION_ROLES = {
     "gigaam-v3-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
     "gigaam-v3-e2e-ctc": frozenset({"asr.model"}),
     "gigaam-v3-e2e-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
+    "gigaam-multilingual-ctc": frozenset({"asr.model"}),
+    "gigaam-multilingual-large-ctc": frozenset({"asr.model"}),
     "nemo-fastconformer-ru-ctc": frozenset({"asr.model"}),
     "nemo-fastconformer-ru-rnnt": frozenset({"asr.encoder", "asr.decoder_joint"}),
     "nemo-parakeet-ctc-0.6b": frozenset({"asr.model"}),
@@ -230,7 +232,7 @@ def _reject_unknown_session_fields(candidate: object, known_fields: frozenset[st
 def recognize(pipeline: Pipeline, wav_path: Path, duration: float, language: str | None) -> dict[str, object]:
     threshold = pipeline.settings.vad.min_audio_seconds
     use_vad = threshold is not None and duration >= threshold
-    kwargs = {"language": language} if language else {}
+    kwargs = {"language": language} if language and model_languages(pipeline.settings.model) == ["multilingual"] else {}
     if use_vad:
         if pipeline.vad_model is None:
             raise safe_error("vad_not_installed")

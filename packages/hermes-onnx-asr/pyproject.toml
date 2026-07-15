@@ -12,10 +12,10 @@ license = { text = "MIT" }
 authors = [{ name = "Hermes ONNX ASR contributors" }]
 dependencies = [
     "filelock>=3.16,<4",
-    "hermes-agent>=0.18.2,<0.19",
+    "hermes-agent>=0.18.2",
     "huggingface-hub>=0.27,<2",
-    "onnx-asr[cpu]==0.11.0",
-    "onnxruntime==1.23.2",
+    "onnx-asr[cpu]>=0.12.0",
+    "onnxruntime>=1.23.2",
     "packaging>=24,<27",
     "pydantic>=2.10.0,<3",
     "pydantic-settings>=2.7.0,<3",

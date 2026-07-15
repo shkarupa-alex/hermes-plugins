@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from hermes_onnx_asr.catalog import upstream_model_names
+from hermes_onnx_asr.catalog import catalog_model_entries
 from hermes_onnx_asr.config import OnnxAsrSettings
 from hermes_onnx_asr.errors import OnnxAsrError
 from hermes_onnx_asr.pipeline import (
@@ -56,7 +56,7 @@ class VadModel:
 
 
 def test_every_upstream_model_has_an_exact_cpu_session_manifest() -> None:
-    assert set(MODEL_SESSION_ROLES) == set(upstream_model_names())
+    assert set(MODEL_SESSION_ROLES) == {entry.alias for entry in catalog_model_entries()}
 
 
 def test_cpu_audit_rejects_non_cpu_session() -> None:

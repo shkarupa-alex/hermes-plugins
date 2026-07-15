@@ -3,8 +3,9 @@ import asyncio
 import hashlib
 import json
 import secrets
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,7 @@ from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
 from pydantic import TypeAdapter
 
+from hermes_vk_community.capabilities import load_capability_profile, rich_capability_ready
 from hermes_vk_community.client import VkApiClient
 from hermes_vk_community.compat import check_compatibility
 from hermes_vk_community.config import API_VERSION, PolicyEnvironment, VkSettings
@@ -23,7 +25,6 @@ from hermes_vk_community.models import (
     FormattingProbeArtifact,
     FormattingProbeCase,
     JsonObject,
-    VkCapabilityProfile,
 )
 from hermes_vk_community.setup import (
     _load_group,  # pyright: ignore[reportPrivateUsage]
@@ -34,6 +35,14 @@ from hermes_vk_community.storage import VkStorage
 
 MIN_PAIRING_TTL = 60
 MAX_PAIRING_TTL = 86_400
+
+
+@dataclass(frozen=True, slots=True)
+class _FormattingProbeInput:
+    name: str
+    message: str
+    format_data: JsonObject | None = None
+
 
 if TYPE_CHECKING:
     import argparse
@@ -97,7 +106,7 @@ def _load_settings() -> VkSettings:
     return VkSettings.model_validate(raw)
 
 
-async def _doctor(  # noqa: PLR0915
+async def _doctor(  # noqa: C901, PLR0912, PLR0915 - diagnostics report every independent release gate
     *, show_inflight: bool, show_delivery_unknown: bool
 ) -> int:
     ok = True
@@ -166,14 +175,20 @@ async def _doctor(  # noqa: PLR0915
             ok = False
         finally:
             await client.close()
-    capability = files("hermes_vk_community").joinpath("data/vk-capabilities.json")
-    try:
-        capability_profile = VkCapabilityProfile.model_validate_json(capability.read_text(encoding="utf-8"))
-        capability_ready = capability_profile.api_version == settings.api_version
-    except (OSError, ValueError):
-        capability_ready = False
-    print(f"Formatting:  {'plain capability profile present' if capability_ready else 'profile missing'}")
-    ok &= capability_ready
+    capability_profile = load_capability_profile()
+    capability_ready = rich_capability_ready(
+        settings.api_version,
+        require_edit=settings.formatting.mode == "rich",
+    )
+    if settings.formatting.mode == "plain":
+        formatting_status = "plain mode (rich profile available)" if capability_ready else "plain mode"
+    elif capability_ready and capability_profile is not None:
+        formatting_status = f"{capability_profile.profile} ready ({settings.formatting.mode})"
+    else:
+        formatting_status = f"rich profile unavailable ({settings.formatting.mode})"
+    print(f"Formatting:  {formatting_status}")
+    if settings.formatting.mode == "rich":
+        ok &= capability_ready
     print("Media:       pinned HTTPS download/upload flows available")
     return 0 if ok else 1
 
@@ -203,32 +218,33 @@ async def _probe_formatting(peer_id: int, output: Path) -> int:
     if not token:
         return 1
     client = VkApiClient(token)
-    cases = [
-        ("plain", "Обычный текст: Кириллица 😀 & < >"),
-        ("html", "<b>Жирный</b> <i>курсив</i> <u>подчёркнутый</u>"),
-        ("link", '<a href="https://example.com/">ссылка</a>'),
-        ("markdown", "**Жирный Markdown** и *курсив*, `код`, ~~strike~~"),
-        ("nested_malformed", "<b>жирный <i>вложенный</b> хвост</i> <broken>"),
-        ("quote_list", "> цитата\n\n• первый пункт\n• второй пункт"),
-        ("table", "<table><tr><th>A</th><th>Б</th></tr><tr><td>1</td><td>😀</td></tr></table>"),
-        ("long_4096", "Я" * 4096),
-    ]
+    cases = _formatting_probe_inputs()
     artifact = FormattingProbeArtifact(
         api_version=API_VERSION,
         generated_at=datetime.now(UTC).isoformat(),
         cases=[],
     )
     try:
-        for name, message in cases:
+        for case in cases:
+            name = case.name
+            message = case.message
+            message_id: int | None = None
             try:
+                send_params: dict[str, object] = {
+                    "peer_id": peer_id,
+                    "random_id": secrets.randbelow(2_147_483_647) + 1,
+                    "message": message,
+                    "disable_mentions": True,
+                }
+                if case.format_data is not None:
+                    send_params["format_data"] = json.dumps(
+                        case.format_data,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                 response = await client.call(
                     "messages.send",
-                    {
-                        "peer_id": peer_id,
-                        "random_id": secrets.randbelow(2_147_483_647) + 1,
-                        "message": message,
-                        "disable_mentions": True,
-                    },
+                    send_params,
                 )
                 message_id = _probe_message_id(response)
                 readback = await client.call("messages.getById", {"message_ids": message_id})
@@ -240,6 +256,7 @@ async def _probe_formatting(peer_id: int, output: Path) -> int:
                         request_message=_bounded_probe_text(message),
                         request_length=len(message),
                         request_sha256=hashlib.sha256(message.encode()).hexdigest(),
+                        request_format_data=case.format_data,
                         send_status="accepted",
                         readback_text=_bounded_probe_text(text) if text is not None else None,
                         readback_length=len(text) if text is not None else None,
@@ -248,10 +265,23 @@ async def _probe_formatting(peer_id: int, output: Path) -> int:
                     )
                 )
                 if name == "plain":
-                    edited = "<b>Редактирование</b> **Markdown**"
+                    edited = "Жирное редактирование"
+                    edit_format_data: JsonObject = {
+                        "version": 1,
+                        "items": [{"type": "bold", "offset": 0, "length": len("Жирное")}],
+                    }
                     await client.call(
                         "messages.edit",
-                        {"peer_id": peer_id, "message_id": message_id, "message": edited},
+                        {
+                            "peer_id": peer_id,
+                            "message_id": message_id,
+                            "message": edited,
+                            "format_data": json.dumps(
+                                edit_format_data,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
                     )
                     edited_readback = await client.call("messages.getById", {"message_ids": message_id})
                     edit_text, edit_format = _probe_readback(edited_readback)
@@ -262,6 +292,7 @@ async def _probe_formatting(peer_id: int, output: Path) -> int:
                             request_message=edited,
                             request_length=len(edited),
                             request_sha256=hashlib.sha256(edited.encode()).hexdigest(),
+                            request_format_data=edit_format_data,
                             send_status="accepted",
                             readback_text=edit_text,
                             readback_length=len(edit_text) if edit_text is not None else None,
@@ -279,14 +310,123 @@ async def _probe_formatting(peer_id: int, output: Path) -> int:
                         request_message=_bounded_probe_text(message),
                         request_length=len(message),
                         request_sha256=hashlib.sha256(message.encode()).hexdigest(),
+                        request_format_data=case.format_data,
                         send_status="rejected",
                         error_code=exc.code,
                     )
                 )
+            finally:
+                if message_id is not None:
+                    with suppress(Exception):  # best-effort cleanup of visible probe messages
+                        await client.call(
+                            "messages.delete",
+                            {"peer_id": peer_id, "message_ids": message_id, "delete_for_all": True},
+                        )
     finally:
         await client.close()
     await asyncio.to_thread(_write_probe, output, artifact)
     return 0
+
+
+def _formatting_probe_inputs() -> list[_FormattingProbeInput]:
+    rich = "Жирный курсив подчёркнутый ссылка"
+    rich_items: list[dict[str, object]] = []
+    for kind, label in (("bold", "Жирный"), ("italic", "курсив"), ("underline", "подчёркнутый")):
+        rich_items.append({"type": kind, "offset": rich.index(label), "length": len(label)})
+    link_label = "ссылка"
+    rich_items.append(
+        {
+            "type": "url",
+            "offset": rich.index(link_label),
+            "length": len(link_label),
+            "url": "https://example.com/",
+        }
+    )
+    unicode_text = "😀 Жирный e\u0301"
+    bold_offset = unicode_text.index("Жирный")
+    underline_offset = unicode_text.index("e\u0301")
+    unicode_items: list[dict[str, object]] = [
+        {
+            "type": "bold",
+            "offset": bold_offset,
+            "length": len("Жирный"),
+        },
+        {
+            "type": "underline",
+            "offset": underline_offset,
+            "length": len("e\u0301"),
+        },
+    ]
+    utf16_items: list[dict[str, object]] = [
+        {
+            "type": "bold",
+            "offset": _utf16_units(unicode_text[:bold_offset]),
+            "length": _utf16_units("Жирный"),
+        },
+        {
+            "type": "underline",
+            "offset": _utf16_units(unicode_text[:underline_offset]),
+            "length": _utf16_units("e\u0301"),
+        },
+    ]
+    nested = "Жирный курсив"
+    overlap = "частичный overlap"
+    return [
+        _FormattingProbeInput("plain", "Обычный текст: Кириллица 😀 & < >"),
+        _FormattingProbeInput(
+            "format_data_basic",
+            rich,
+            _probe_format_data(rich_items),
+        ),
+        _FormattingProbeInput(
+            "format_data_nested_same_boundary",
+            nested,
+            _probe_format_data(
+                [
+                    {"type": "bold", "offset": 0, "length": len(nested)},
+                    {"type": "italic", "offset": nested.index("курсив"), "length": len("курсив")},
+                ]
+            ),
+        ),
+        _FormattingProbeInput(
+            "format_data_partial_overlap",
+            overlap,
+            _probe_format_data(
+                [
+                    {"type": "bold", "offset": 0, "length": len("частичный")},
+                    {"type": "italic", "offset": 5, "length": len("чный overlap")},
+                ]
+            ),
+        ),
+        _FormattingProbeInput(
+            "format_data_unicode_codepoints",
+            unicode_text,
+            _probe_format_data(unicode_items),
+        ),
+        _FormattingProbeInput(
+            "format_data_unicode_utf16",
+            unicode_text,
+            _probe_format_data(utf16_items),
+        ),
+        _FormattingProbeInput("html", "<b>Жирный</b> <i>курсив</i> <u>подчёркнутый</u>"),
+        _FormattingProbeInput("link", '<a href="https://example.com/">ссылка</a>'),
+        _FormattingProbeInput("markdown", "**Жирный Markdown** и *курсив*, `код`, ~~strike~~"),
+        _FormattingProbeInput("nested_malformed", "<b>жирный <i>вложенный</b> хвост</i> <broken>"),
+        _FormattingProbeInput("quote_list", "> цитата\n\n• первый пункт\n• второй пункт"),
+        _FormattingProbeInput(
+            "table",
+            "<table><tr><th>A</th><th>Б</th></tr><tr><td>1</td><td>😀</td></tr></table>",
+        ),
+        _FormattingProbeInput("long_4096", "Я" * 4096),
+    ]
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _probe_format_data(items: list[dict[str, object]]) -> JsonObject:
+    return TypeAdapter(JsonObject).validate_python({"version": 1, "items": items})
 
 
 def _write_probe(output: Path, artifact: FormattingProbeArtifact) -> None:

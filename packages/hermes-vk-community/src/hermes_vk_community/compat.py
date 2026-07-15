@@ -3,6 +3,7 @@ import inspect
 from importlib.metadata import PackageNotFoundError, version
 
 from gateway.platforms.base import BasePlatformAdapter
+from hermes_cli.plugins import PluginContext
 from packaging.version import Version
 
 MIN_HERMES = Version("0.18.2")
@@ -16,7 +17,7 @@ def _shape(function: object) -> tuple[tuple[str, int, bool], ...]:
     )
 
 
-def check_compatibility() -> tuple[bool, str]:
+def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract mismatch has a precise diagnostic
     try:
         installed = Version(version("hermes-agent"))
     except PackageNotFoundError:
@@ -125,6 +126,9 @@ def check_compatibility() -> tuple[bool, str]:
     )
     if _shape(VkCommunityAdapter.send_exec_approval) != exec_shape:
         return False, "VkCommunityAdapter.send_exec_approval signature drifted from gateway/run.py"
+    for registration_method in ("register_platform", "register_cli_command"):
+        if not callable(getattr(PluginContext, registration_method, None)):
+            return False, f"Hermes does not expose {registration_method}"
     return True, f"Hermes {installed} contract is compatible"
 
 

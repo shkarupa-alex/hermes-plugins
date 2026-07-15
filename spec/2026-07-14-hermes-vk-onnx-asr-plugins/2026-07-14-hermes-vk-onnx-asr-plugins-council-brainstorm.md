@@ -204,9 +204,9 @@ wheel registers the `vk` command group and the ASR wheel the `onnx-asr` group,
 with setup/handler functions whose signatures are pinned by the contract
 harness.
 
-The package metadata MUST constrain Hermes to a contract-tested range, initially
-`hermes-agent>=0.18.2,<0.19`. Raising the upper bound requires contract-suite
-success.
+The package metadata declares the minimum `hermes-agent>=0.18.2`. Runtime
+compatibility remains fail-closed outside the contract-tested range, initially
+`>=0.18.2,<0.19`; extending that range requires contract-suite success.
 
 ## 4. VK Community plugin
 
@@ -279,7 +279,7 @@ platforms:
       fallback: plain
       disable_mentions: true
       parse_link_previews: true
-      table_style: records
+      table_style: jpeg
 
     streaming:
       enabled: true
@@ -427,7 +427,8 @@ and certificate verification. Connection reuse is scoped to that hostname and
 validated address set; DNS is re-resolved before a new connection. Tokens,
 Long Poll keys, and media authorization never appear in logs or exception URLs.
 
-The concrete direct dependency is `aiohttp==3.14.1`, matching the pinned Hermes
+The concrete direct dependency requires `aiohttp>=3.14.1`; the release lock
+pins the tested version matching the Hermes
 messaging extra. `ClientSession(trust_env=False)` forbids inherited HTTP(S)
 proxies. `VkPinnedResolver` implements `aiohttp.abc.AbstractResolver`: it
 canonicalizes and suffix-checks the URL host, resolves A/AAAA with the event
@@ -665,27 +666,29 @@ class VkMessageRenderer(Protocol):
     ) -> ParsedIncomingMessage: ...
 ```
 
-The renderer uses a Markdown AST parser, not regex-only rewriting. All generated
-HTML is allowlist-sanitized and attribute-escaped. Candidate rich mappings are:
+The renderer uses a Markdown AST parser, not regex-only rewriting. It never
+sends generated HTML or raw Markdown. The tested mappings are:
 
 | Markdown | Rich candidate | Guaranteed plain fallback |
 |---|---|---|
-| bold | `<b>` | text |
-| italic | `<i>` | text |
-| underline | `<u>` | text |
-| link | `<a href>` | `label — URL` |
-| heading | supported heading or bold | paragraph |
+| bold | `format_data` bold range | text |
+| italic | `format_data` italic range | text |
+| underline | `format_data` underline range | text |
+| link | `format_data` url range | `label — URL` |
+| heading | `format_data` bold range | paragraph |
 | inline code | `<code>` | literal backticks |
 | fenced code | `<pre><code>` | `Code:` plus exact body |
-| quote | `<blockquote>` | `> text` |
+| quote | `▎` prefix plus italic range | `▎ text` |
 | strike | `<s>`/`<del>` | text |
 | spoiler | tested special representation | `Spoiler: text` |
-| list | `<ul>/<ol>/<li>` | bullets/numbers |
-| table | `<table>` family | row records |
+| list | Unicode bullets/numbers with indentation | bullets/numbers |
+| standalone image | VK photo attachment | alt text plus URL |
+| table | one or more RGB JPEG photos | row records |
 
-Only bold, italic, underline, and link are initial rich candidates. Every other
-entry, especially tables, becomes enabled only after the live formatting spike
-proves send, readback, edit, and client rendering.
+Bold, italic, underline, and URL ranges are accepted by send and edit and were
+visually confirmed in VK Web. Tables deliberately do not rely on native VK
+markup: they are always rendered locally as JPEG photos. Text before and after
+a table is delivered as separate messages in source order.
 
 Formatting is performed before chunking. Chunking preserves paragraphs, list
 items, and code bodies. The conservative baseline `messages.send` limit is 4096
@@ -728,13 +731,13 @@ The fixture records request shape, redacted API response, readback `text`,
 `format_data`, tested client, and manual visual outcome. Raw HTML appearing in a
 client is a failed capability.
 
-This spike is a release gate before rich renderer/edit implementation, not a
-post-hoc test. Its machine-readable profile fixes the accepted request field,
+This spike is a release gate for rich renderer/edit behavior. Its
+machine-readable profile fixes the accepted request field,
 schema/version, offset unit, nesting/overlap rules, supported tag/entity set,
-send/edit limits, and client matrix. Until that artifact exists, `auto` behaves
-as deterministic plain mode and `rich` fails validation. Updating the fixture
-changes the capability profile and tests; implementation code never guesses an
-undocumented `format_data` shape.
+send/edit limits, and client matrix. The committed 2026-07-15 artifact enables
+`format-data-v1` for `auto` and `rich`; an unknown profile falls back to plain.
+Updating the fixture changes the capability profile and tests; implementation
+code never guesses an undocumented `format_data` shape.
 
 ### 4.12 Typing status
 
@@ -930,8 +933,9 @@ The provider name is `onnx_asr`. The default model is:
 gigaam-v3-e2e-rnnt
 ```
 
-The initial reproducible release pins `onnx-asr[cpu]==0.11.0` and
-`onnxruntime==1.23.2` in per-platform lock files. It never installs
+The package metadata requires `onnx-asr[cpu]>=0.12.0` and
+`onnxruntime>=1.23.2`; per-platform lock files pin the concrete versions used
+for each release. It never installs
 `onnxruntime-gpu`. A platform for which those exact wheels are unavailable is
 not released by silently loosening the pins; updating either pin requires the
 full model, CPU-provider, codec, and long-file suite. This deliberately avoids
@@ -1095,7 +1099,7 @@ CPU-only.
 
 The audit does not globally monkey-patch `onnxruntime.InferenceSession`. Under a
 model-load lock it uses a pinned, version-specific introspector over stable
-session-bearing fields in `onnx-asr==0.11.0`. For the default E2E RNNT profile,
+session-bearing fields in the locked `onnx-asr>=0.12.0`. For the default E2E RNNT profile,
 the role manifest requires `asr.encoder`, `asr.decoder`, `asr.joiner`, optional
 `vad.silero`, and, after an 8 kHz warm-up, `resampler.8000_to_16000`; the NumPy
 preprocessor has no ORT session. Missing, duplicate, or unknown session roles
@@ -1377,7 +1381,7 @@ ffmpeg:          ready
 Warm-up:        passed
 ```
 
-It checks discovery, configuration, exact dependency versions, ffmpeg,
+It checks discovery, configuration, minimum dependency versions, ffmpeg,
 model/VAD manifests, wrapper sharing, all observed ORT providers, warm-up,
 queue state, available temp space, stale temp directories, and the one-profile
 constraint.
@@ -1416,8 +1420,8 @@ Debug logging of payloads is opt-in, bounded, sanitized, and disabled by default
 
 ### 6.2 Supply chain
 
-- Pin exact release constraints for `onnx-asr` and compatible CPU
-  `onnxruntime` in the release lock.
+- Declare minimum supported versions for `onnx-asr` and compatible CPU
+  `onnxruntime`; pin concrete versions in the release lock.
 - No CUDA, TensorRT, or CoreML extras are installed.
 - Model manifests pin repository revisions and required files.
 - CI runs dependency and secret scanning.
@@ -1603,7 +1607,7 @@ Deferred:
 
 - VK Callback API for public-HTTPS/multi-replica deployments;
 - VK video upload and carousel/template messages;
-- rich table support until the live spike proves it;
+- native VK rich tables; tables are rendered as JPEG photos instead;
 - ASR sidecar/subprocess isolation unless measurements justify it;
 - speaker diarization and LLM transcript cleanup;
 - realtime microphone streaming;
@@ -1651,9 +1655,9 @@ Deferred:
 | D35 | YAML-only VK authorization plus `enforces_own_access_policy` | adopted | Prevents environment bypass while satisfying Hermes' second-line gate |
 | D36 | Worker owns normalized WAV after caller timeout | adopted | ORT inference is not cancellable and must not lose its active input |
 | D37 | No speech is a deterministic failure | adopted | Hermes does not safely ignore a successful empty transcript |
-| D38 | Exact `onnx-asr`/ORT pins and manifest-verified offline bundles | adopted | Makes CPU/offline behavior reproducible |
+| D38 | Minimum `onnx-asr`/ORT metadata versions, release-lock pins, and manifest-verified offline bundles | adopted | Allows compatible upgrades while keeping releases reproducible |
 | D39 | Partial ordinary send reports success; ambiguous send uses Hermes timeout marker | adopted | Suppresses the actual `_send_with_retry()` whole-message fallback after possible visibility |
-| D40 | `aiohttp==3.14.1` custom resolver with global-only IP predicate | adopted | Pins DNS answers while preserving original-host TLS SNI and certificate checks |
+| D40 | `aiohttp>=3.14.1` custom resolver with global-only IP predicate; concrete release-lock pin | adopted | Pins DNS answers while preserving original-host TLS SNI and certificate checks |
 | D41 | Global and VK env authorization conflicts fail VK startup | adopted | Keeps effective VK authorization strictly YAML-only |
 | D42 | V1 groups disabled; SQLite default partitioned by profile/group | adopted | Avoids trusting an unspecified group gate and prevents state collisions |
 
@@ -1668,7 +1672,8 @@ The specification is implemented when:
 - VK typing is visible during processing;
 - Markdown is rendered through a live-tested rich profile with safe plain
   fallback;
-- tables are enabled only if the spike proves them;
+- Markdown tables are always rendered as JPEG photos and keep source order with
+  surrounding text;
 - VK partial/ambiguous delivery is observable and never blindly duplicated;
 - `gigaam-v3-e2e-rnnt` is the tested default;
 - short audio uses base GigaAM and audio at/above 20 seconds uses the shared

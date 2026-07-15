@@ -23,6 +23,8 @@ from hermes_vk_community.security import LONG_POLL_SUFFIXES, MEDIA_SUFFIXES, VkP
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
+    from aiohttp.abc import AbstractResolver
+
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -31,7 +33,7 @@ HTTP_REDIRECT_MIN = 300
 HTTP_ERROR_MIN = 400
 
 
-def _connector(resolver: VkPinnedResolver) -> aiohttp.TCPConnector:
+def _connector(resolver: AbstractResolver) -> aiohttp.TCPConnector:
     context = ssl.create_default_context()
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED

@@ -15,9 +15,10 @@ from pydantic import ValidationError
 
 from hermes_onnx_asr.catalog import (
     bundle_path,
+    catalog_model_entries,
     certified_model_names,
     fetch_bundle,
-    model_entry,
+    model_languages,
     upstream_model_names,
     verify_bundle,
 )
@@ -93,12 +94,17 @@ def handle_command(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911 - ar
 
 def _list_models() -> int:
     certified = set(certified_model_names())
-    for alias in upstream_model_names():
-        entry = model_entry(alias)
+    entries = catalog_model_entries()
+    known = {entry.alias for entry in entries}
+    for entry in entries:
+        alias = entry.alias
         marker = " (default)" if alias == "gigaam-v3-e2e-rnnt" else ""
         quantizations = ", ".join(value or "fp32" for value in entry.quantizations)
         status = "certified" if alias in certified else "pending smoke"
         print(f"{alias}{marker}: {quantizations} [{status}]")
+    for alias in upstream_model_names():
+        if alias not in known:
+            print(f"{alias}: [pending catalog]")
     return 0
 
 
@@ -111,7 +117,7 @@ def _warmup() -> int:
             sample = Path(directory) / "russian.wav"
             sample.write_bytes(fixture.read_bytes())
             transcript = str(pipeline.base_model.recognize(sample, channel="mean")).strip()
-            _require_russian_warmup(transcript)
+            _require_warmup_transcript(transcript, require_russian=model_languages(settings.model) == ["ru"])
             if pipeline.vad_model is not None:
                 long_sample = Path(directory) / "russian-vad.wav"
                 _repeat_wav(sample, long_sample, minimum_seconds=21)
@@ -141,8 +147,10 @@ def _repeat_wav(source: Path, destination: Path, *, minimum_seconds: int) -> Non
         output_audio.writeframes(frames * repeats)
 
 
-def _require_russian_warmup(transcript: str) -> None:
-    if not transcript or "проверк" not in transcript.casefold():
+def _require_warmup_transcript(transcript: str, *, require_russian: bool) -> None:
+    if not transcript:
+        raise ValueError("Speech fixture produced no transcript")
+    if require_russian and "проверк" not in transcript.casefold():
         raise ValueError("Russian speech fixture was not recognized")
 
 

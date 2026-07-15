@@ -1,6 +1,9 @@
 from __future__ import annotations
 import atexit
+import errno
 import importlib.util
+import os
+import shutil
 import tempfile
 import threading
 import time
@@ -22,26 +25,10 @@ from hermes_onnx_asr.audio import (
     validate_source,
     wav_duration,
 )
-from hermes_onnx_asr.catalog import certified_model_names
+from hermes_onnx_asr.catalog import certified_model_names, model_languages
 from hermes_onnx_asr.config import DEFAULT_MODEL, OnnxAsrSettings, load_settings
 from hermes_onnx_asr.errors import OnnxAsrError, safe_error
 from hermes_onnx_asr.pipeline import Pipeline, load_pipeline, recognize
-
-
-def _model_languages(alias: str) -> list[str]:
-    if alias in {
-        "nemo-parakeet-tdt-0.6b-v3",
-        "nemo-canary-1b-v2",
-        "whisper-base",
-    }:
-        return ["multilingual"]
-    if alias in {
-        "nemo-parakeet-ctc-0.6b",
-        "nemo-parakeet-rnnt-0.6b",
-        "nemo-parakeet-tdt-0.6b-v2",
-    }:
-        return ["en"]
-    return ["ru"]
 
 
 @dataclass
@@ -51,6 +38,42 @@ class _Job:
     language: str | None
     deadline: float
     future: Future[dict[str, object]]
+    owned_source: tempfile.TemporaryDirectory[str] | None = None
+
+    def cleanup(self) -> None:
+        owned_source = self.owned_source
+        self.owned_source = None
+        if owned_source is not None:
+            owned_source.cleanup()
+
+
+def _own_source(source: Path, safety_margin: int) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
+    """Acquire a caller-independent path after reservation and before worker publication."""
+    validate_source(source)
+    try:
+        owned_source = tempfile.TemporaryDirectory(prefix="hermes-onnx-asr-source-")
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise safe_error("insufficient_temp_space") from exc
+        raise
+    staged = Path(owned_source.name) / f"input{source.suffix}"
+    try:
+        try:
+            os.link(source, staged)
+        except OSError:
+            required = source.stat().st_size + safety_margin
+            if shutil.disk_usage(owned_source.name).free < required:
+                raise safe_error("insufficient_temp_space") from None
+            shutil.copyfile(source, staged)
+    except OSError as exc:
+        owned_source.cleanup()
+        if exc.errno == errno.ENOSPC:
+            raise safe_error("insufficient_temp_space") from exc
+        raise
+    except Exception:
+        owned_source.cleanup()
+        raise
+    return staged, owned_source
 
 
 class _Scheduler:
@@ -79,8 +102,23 @@ class _Scheduler:
         return self._shutting_down
 
     def submit(self, job: _Job) -> bool:
+        if not self.reserve():
+            return False
+        return self.submit_reserved(job)
+
+    def reserve(self) -> bool:
+        """Reserve bounded admission before potentially expensive source staging."""
         with self._state_lock:
-            if self._shutting_down or not self._admission.acquire(blocking=False):
+            return not (self._shutting_down or not self._admission.acquire(blocking=False))
+
+    def release_reserved(self) -> None:
+        self._admission.release()
+
+    def submit_reserved(self, job: _Job) -> bool:
+        """Publish a job after its caller has acquired a reservation."""
+        with self._state_lock:
+            if self._shutting_down:
+                self._admission.release()
                 return False
             self._jobs.append(job)
             self._condition.notify()
@@ -94,6 +132,7 @@ class _Scheduler:
             except ValueError:
                 return False
             self._admission.release()
+            job.cleanup()
             return True
 
     def _key(self, settings: OnnxAsrSettings) -> tuple[object, ...]:
@@ -131,10 +170,15 @@ class _Scheduler:
         if remaining <= 0:
             raise safe_error("asr_timeout")
         with tempfile.TemporaryDirectory(prefix="hermes-onnx-asr-") as work_dir:
+            wav_path = Path(work_dir) / "input.wav"
             if is_compatible_pcm_wav(job.source):
-                wav_path = job.source
+                # ORT inference is not cancellable. Keep a worker-owned path alive after
+                # the caller's waiter times out and is free to remove its source file.
+                try:
+                    os.link(job.source, wav_path)
+                except OSError:
+                    shutil.copyfile(job.source, wav_path)
             else:
-                wav_path = Path(work_dir) / "input.wav"
                 normalize_audio(
                     job.source,
                     wav_path,
@@ -167,6 +211,7 @@ class _Scheduler:
                 job.future.set_result(result)
             finally:
                 self._admission.release()
+                job.cleanup()
 
     def shutdown(self, grace_seconds: float = 30) -> None:
         with self._state_lock:
@@ -177,6 +222,7 @@ class _Scheduler:
                 job = self._jobs.popleft()
                 job.future.set_result(failure_result(safe_error("provider_shutting_down")))
                 self._admission.release()
+                job.cleanup()
             self._condition.notify_all()
         self._worker.join(timeout=grace_seconds)
 
@@ -211,7 +257,7 @@ class OnnxAsrProvider(TranscriptionProvider):
 
     def list_models(self) -> list[dict[str, Any]]:
         return [
-            {"id": alias, "display": alias, "languages": _model_languages(alias)} for alias in certified_model_names()
+            {"id": alias, "display": alias, "languages": model_languages(alias)} for alias in certified_model_names()
         ]
 
     def get_setup_schema(self) -> dict[str, Any]:
@@ -245,7 +291,7 @@ class OnnxAsrProvider(TranscriptionProvider):
                 self._scheduler = _Scheduler(settings.runtime.queue_depth)
             return self._scheduler
 
-    def transcribe(
+    def transcribe(  # noqa: PLR0911 - provider boundary maps each admission failure explicitly
         self,
         file_path: str,
         *,
@@ -262,19 +308,34 @@ class OnnxAsrProvider(TranscriptionProvider):
             effective_language = language if language is not None else settings.language
             scheduler = self._get_scheduler(settings)
             timeout = settings.runtime.transcription_timeout_seconds
-            future: Future[dict[str, object]] = Future()
-            job = _Job(
-                source=Path(file_path),
-                settings=settings,
-                language=effective_language,
-                deadline=time.monotonic() + timeout,
-                future=future,
-            )
-            if not scheduler.submit(job):
+            deadline = time.monotonic() + timeout
+            if not scheduler.reserve():
                 code = "provider_shutting_down" if scheduler.is_shutting_down else "asr_queue_full"
                 return failure_result(safe_error(code))
             try:
-                return future.result(timeout=timeout)
+                source, owned_source = _own_source(Path(file_path), settings.audio.temp_safety_margin_bytes)
+            except Exception:
+                scheduler.release_reserved()
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                owned_source.cleanup()
+                scheduler.release_reserved()
+                return failure_result(safe_error("asr_timeout"))
+            future: Future[dict[str, object]] = Future()
+            job = _Job(
+                source=source,
+                settings=settings,
+                language=effective_language,
+                deadline=deadline,
+                future=future,
+                owned_source=owned_source,
+            )
+            if not scheduler.submit_reserved(job):
+                job.cleanup()
+                return failure_result(safe_error("provider_shutting_down"))
+            try:
+                return future.result(timeout=remaining)
             except FutureTimeoutError:
                 scheduler.cancel_queued(job)
                 return failure_result(safe_error("asr_timeout"))

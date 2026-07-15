@@ -1,11 +1,26 @@
 name: Release gates
 
 on:
+  workflow_call:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
 
 jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Audit locked production dependencies
+        run: |
+          uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
+          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip
+      - name: Scan repository history for secrets
+        uses: gitleaks/gitleaks-action@v2
+
   cpu-session-audit:
     strategy:
       fail-fast: false
@@ -68,6 +83,8 @@ jobs:
           - {model: gigaam-v3-rnnt, quantization: int8}
           - {model: gigaam-v3-e2e-ctc, quantization: int8}
           - {model: gigaam-v3-e2e-rnnt, quantization: int8}
+          - {model: gigaam-multilingual-ctc, quantization: int8}
+          - {model: gigaam-multilingual-large-ctc, quantization: int8}
           - {model: nemo-fastconformer-ru-ctc, quantization: int8}
           - {model: nemo-fastconformer-ru-rnnt, quantization: int8}
           - {model: nemo-parakeet-ctc-0.6b, quantization: int8}

@@ -4,7 +4,13 @@ from typing import Any, cast
 from hermes_cli.config import read_raw_config, save_config
 from hermes_cli.setup import print_header, print_info, print_success, prompt, prompt_yes_no
 
-from hermes_onnx_asr.catalog import certified_model_names, fetch_bundle, model_entry, upstream_model_names
+from hermes_onnx_asr.catalog import (
+    catalog_model_entries,
+    certified_model_names,
+    fetch_bundle,
+    model_entry,
+    upstream_model_names,
+)
 from hermes_onnx_asr.config import DEFAULT_MODEL, OnnxAsrSettings, VadSettings
 
 
@@ -30,14 +36,20 @@ def write_setup_config(model: str, quantization: str | None, vad_seconds: float 
 
 
 def _select_model() -> str:
-    aliases = upstream_model_names()
+    upstream = upstream_model_names()
+    entries = catalog_model_entries()
+    aliases = tuple(entry.alias for entry in entries)
     certified = set(certified_model_names())
     print_info("Модели, объявленные установленной версией onnx-asr:")
-    for index, alias in enumerate(aliases, start=1):
-        quantizations = ", ".join(value or "fp32" for value in model_entry(alias).quantizations)
+    for index, entry in enumerate(entries, start=1):
+        alias = entry.alias
+        quantizations = ", ".join(value or "fp32" for value in entry.quantizations)
         status = "certified" if alias in certified else "pending smoke"
         marker = ", по умолчанию" if alias == DEFAULT_MODEL else ""
         print_info(f"  {index:>2}. {alias} [{quantizations}; {status}{marker}]")
+    for alias in upstream:
+        if alias not in aliases:
+            print_info(f"   -. {alias} [pending catalog]")
     default_choice = str(aliases.index(DEFAULT_MODEL) + 1)
     raw_model = prompt("Модель — номер или точное имя", default=default_choice).strip()
     selected = aliases[int(raw_model) - 1] if raw_model.isdigit() and 1 <= int(raw_model) <= len(aliases) else raw_model

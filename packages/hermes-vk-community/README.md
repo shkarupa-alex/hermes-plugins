@@ -139,16 +139,37 @@ uv run pyright packages/hermes-vk-community
 hermes gateway restart
 ```
 
-Hermes передаёт адаптеру Markdown. Live-тест API `5.199` от 15 июля 2026 года
-показал, что HTML-теги в `messages.send` отображаются буквально, а официальный
-контракт не содержит `format_data` или parse mode. Поэтому `auto` безопасно
-преобразует Markdown в читаемый текст: сохраняет списки и кликабельные bare URL,
-но не обещает жирный или курсив. Подробности записаны в
+Hermes передаёт адаптеру Markdown. Live-проверенный профиль API `5.199`
+использует Unicode codepoint offsets и компилирует
+`bold`/`italic`/`underline`/`url` в `format_data`; заголовки становятся жирными. Цитаты
+передаются как `▎` плюс курсив, списки — как Unicode-маркеры с отступами.
+Markdown-таблицы всегда рендерятся в JPEG и отправляются фотографиями. Поэтому
+смешанный ответ может стать упорядоченной серией сообщений: текст, таблица,
+следующий текст. Отдельная Markdown-картинка аналогично становится фото между
+текстовыми сообщениями. HTML и исходный Markdown в VK отправлять нельзя — клиент
+показывает их буквально.
+
+```bash
+hermes vk probe-formatting --peer-id <PRIVATE_TEST_PEER_ID> \
+  --output vk-formatting-format-data-probe.json
+```
+
+`auto` использует проверенный rich-профиль; явный `rich` доступен для API
+`5.199`, а `plain` оставлен как детерминированный fallback. Unknown profile/API
+по-прежнему переключает `auto` в plain и отклоняет явный rich. Probe проверяет
+send/edit, Unicode offsets и readback, после чего best-effort удаляет тестовые
+сообщения. Подробности и текущий проверенный профиль записаны в
 [`docs/vk-rich-text-compatibility.md`](docs/vk-rich-text-compatibility.md).
 
 Статус «печатает» отправляется через `messages.setActivity`, если
 `typing_indicator: true`; live-тест подтвердил и ответ API, и отображение в
 клиенте VK.
+
+Release live-матрица дополнительно проверяет DM reply на реальное входящее
+сообщение, pinned media download, `format_data`, inline keyboard, photo upload
+и восстановление подготовленного outbox после закрытия/повторного открытия
+SQLite. Для запуска нужны только `VK_COMMUNITY_TOKEN`, `VK_GROUP_ID` и
+`VK_TEST_PEER_ID`; тестовый пользователь должен предварительно прислать фото.
 
 ## Интерактивность, длинные ответы и pairing
 

@@ -45,7 +45,7 @@ class FormattingSettings(BaseModel):
     fallback: Literal["plain"] = "plain"
     disable_mentions: bool = True
     parse_link_previews: bool = True
-    table_style: Literal["records"] = "records"
+    table_style: Literal["jpeg"] = "jpeg"
 
 
 class StreamingSettings(BaseModel):
@@ -97,8 +97,6 @@ class VkSettings(BaseModel):
         self.allow_from = normalized
         if self.api_version != API_VERSION:
             raise ValueError(f"api_version must be {API_VERSION}")
-        if self.formatting.mode == "rich":
-            raise ValueError("formatting.mode=rich requires a committed live VK capability profile")
         return self
 
     def resolve_storage_path(self, hermes_home: Path) -> Path:

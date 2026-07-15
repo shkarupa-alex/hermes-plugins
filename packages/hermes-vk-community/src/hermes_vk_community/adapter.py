@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
-import difflib
 import hashlib
+import json
 import logging
 import secrets
 import shutil
@@ -29,6 +29,7 @@ from tenacity import (
 from tools.approval import resolve_gateway_approval
 from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
 
+from hermes_vk_community.capabilities import rich_capability_ready
 from hermes_vk_community.client import VkApiClient
 from hermes_vk_community.config import PolicyEnvironment, VkSettings, settings_from_platform_config
 from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError
@@ -50,8 +51,16 @@ from hermes_vk_community.models import (
     VkKeyboard,
     VkUpdate,
 )
-from hermes_vk_community.renderer import PlainVkRenderer, split_message, split_message_with_spans
+from hermes_vk_community.renderer import (
+    PlainVkRenderer,
+    RenderedTableSegment,
+    RenderedTextSegment,
+    RichVkRenderer,
+    format_data_for_chunk,
+    split_message_with_spans,
+)
 from hermes_vk_community.storage import InboxRecord, VkStorage
+from hermes_vk_community.table_image import render_table_jpegs
 from tools import slash_confirm
 
 if TYPE_CHECKING:
@@ -97,9 +106,15 @@ class VkCommunityAdapter(BasePlatformAdapter):
         self._lease: LongPollLease | None = None
         self._typing_last: dict[str, float] = {}
         self._typing_cooldown: dict[str, float] = {}
-        self._renderer = PlainVkRenderer()
+        rich_ready = rich_capability_ready(self.settings.api_version)
+        if self.settings.formatting.mode == "rich" and not rich_ready:
+            raise ValueError("VK rich formatting requires the committed format-data-v1 capability profile")
+        self._renderer = (
+            RichVkRenderer() if rich_ready and self.settings.formatting.mode in {"auto", "rich"} else PlainVkRenderer()
+        )
         self._effective_limit = self.settings.max_message_length
         self._interactions: dict[str, _Interaction] = {}
+        self._history_gap_count = 0
 
     @property
     def enforces_own_access_policy(self) -> bool:
@@ -158,7 +173,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         await self._stop_polling()
         await self._close_resources(release_lock=True)
 
-    async def send(  # noqa: PLR0911
+    async def send(
         self,
         chat_id: str,
         content: str,
@@ -171,22 +186,79 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 success=False, error="VK adapter is not connected", retryable=True, error_kind="transient"
             )
         rendered = self._renderer.render_markdown(content)
+        delivered: list[str] = []
+        for segment in rendered.segments:
+            segment_reply = reply_to if not delivered else None
+            if isinstance(segment, RenderedTextSegment):
+                if not segment.text:
+                    continue
+                result = await self._send_text_segment(int(chat_id), segment, segment_reply)
+            elif isinstance(segment, RenderedTableSegment):
+                result = await self._send_table_segment(int(chat_id), segment, segment_reply)
+            else:
+                result = await self.send_image(
+                    chat_id,
+                    segment.url,
+                    caption=segment.alt or None,
+                    reply_to=segment_reply,
+                )
+            segment_ids = _send_result_ids(result)
+            delivered.extend(segment_ids)
+            partial = _partial_delivery_payload(result)
+            if partial is not None:
+                return SendResult(
+                    success=True,
+                    message_id=delivered[-1] if delivered else result.message_id,
+                    continuation_message_ids=tuple(delivered[:-1]),
+                    retryable=False,
+                    raw_response={"partial_delivery": partial},
+                )
+            if not result.success:
+                if delivered:
+                    return SendResult(
+                        success=True,
+                        message_id=delivered[-1],
+                        continuation_message_ids=tuple(delivered[:-1]),
+                        retryable=False,
+                        raw_response={"partial_delivery": {"failed_segment": type(segment).__name__}},
+                    )
+                return result
+        return SendResult(
+            success=True,
+            message_id=delivered[-1] if delivered else None,
+            continuation_message_ids=tuple(delivered[:-1]),
+            retryable=False,
+        )
+
+    async def _send_text_segment(  # noqa: PLR0911 - durable chunk delivery has explicit terminal states
+        self,
+        peer_id: int,
+        rendered: RenderedTextSegment,
+        reply_to: str | None,
+    ) -> SendResult:
+        if self._storage is None:
+            return SendResult(success=False, error="VK adapter is not connected", retryable=True)
         wire_chunks = split_message_with_spans(rendered.text, self._effective_limit)
         chunks = [chunk.text for chunk in wire_chunks]
-        outbox = await self._storage.prepare_outbox(int(chat_id), chunks, reply_to)
+        formats = [format_data_for_chunk(rendered.format_data, chunk) for chunk in wire_chunks]
+        outbox = await self._storage.prepare_outbox(peer_id, chunks, reply_to, format_data=formats)
         delivered: list[str] = []
-        pending = list(zip(chunks, outbox, strict=True))
+        pending = [
+            (chunk, chunk_format, record, wire.start, wire.end)
+            for chunk, chunk_format, record, wire in zip(chunks, formats, outbox, wire_chunks, strict=True)
+        ]
         index = 0
         while index < len(pending):
-            chunk, record = pending[index]
+            chunk, chunk_format, record, chunk_start, _chunk_end = pending[index]
             await self._storage.mark_outbox(record.id, "sending")
             try:
                 response = await self._send_chunk(
                     {
-                        "peer_id": int(chat_id),
+                        "peer_id": peer_id,
                         "message": chunk,
                         "random_id": record.random_id,
                         "reply_to": int(reply_to) if reply_to else None,
+                        "format_data": _format_data_json(chunk_format),
                         "disable_mentions": self.settings.formatting.disable_mentions,
                         "dont_parse_links": not self.settings.formatting.parse_link_previews,
                     },
@@ -199,11 +271,15 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     record,
                     "delivery_unknown",
                     "request timed out",
-                    [item[1] for item in pending[index + 1 :]],
+                    [item[2] for item in pending[index + 1 :]],
                     "blocked after ambiguous earlier chunk",
                 )
                 if delivered:
-                    return _partial_result(delivered, [item[0] for item in pending])
+                    return _partial_result(
+                        delivered,
+                        [item[0] for item in pending],
+                        delivered_characters=pending[index - 1][4],
+                    )
                 return SendResult(
                     success=False,
                     error="VK delivery timed out after the request may have succeeded",
@@ -215,31 +291,61 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 if exc.code == VK_TOO_LONG_ERROR and self._effective_limit > MIN_MESSAGE_LIMIT:
                     await self._storage.mark_outbox(record.id, "failed", error="VK rejected chunk at cached limit")
                     self._effective_limit = max(MIN_MESSAGE_LIMIT, min(self._effective_limit - 1, len(chunk) // 2))
-                    replacement_chunks = split_message(chunk, self._effective_limit)
-                    replacement = await self._storage.prepare_outbox(int(chat_id), replacement_chunks, reply_to)
-                    pending[index : index + 1] = list(zip(replacement_chunks, replacement, strict=True))
+                    replacement_spans = split_message_with_spans(chunk, self._effective_limit)
+                    replacement_chunks = [item.text for item in replacement_spans]
+                    replacement_formats = [format_data_for_chunk(chunk_format, item) for item in replacement_spans]
+                    replacement = await self._storage.prepare_outbox(
+                        peer_id,
+                        replacement_chunks,
+                        reply_to,
+                        format_data=replacement_formats,
+                    )
+                    pending[index : index + 1] = [
+                        (
+                            replacement_chunk,
+                            replacement_format,
+                            replacement_record,
+                            chunk_start + replacement_span.start,
+                            chunk_start + replacement_span.end,
+                        )
+                        for replacement_chunk, replacement_format, replacement_record, replacement_span in zip(
+                            replacement_chunks,
+                            replacement_formats,
+                            replacement,
+                            replacement_spans,
+                            strict=True,
+                        )
+                    ]
                     continue
                 state = "partial_delivery" if delivered else "failed"
                 await self._storage.terminalize_outbox_failure(
                     record,
                     state,
                     _safe_api_error(exc),
-                    [item[1] for item in pending[index + 1 :]],
+                    [item[2] for item in pending[index + 1 :]],
                     "blocked after failed earlier chunk",
                 )
                 if delivered:
-                    return _partial_result(delivered, [item[0] for item in pending])
+                    return _partial_result(
+                        delivered,
+                        [item[0] for item in pending],
+                        delivered_characters=pending[index - 1][4],
+                    )
                 return _api_error_result(exc)
             except Exception as exc:  # noqa: BLE001
                 await self._storage.terminalize_outbox_failure(
                     record,
                     "delivery_unknown",
                     type(exc).__name__,
-                    [item[1] for item in pending[index + 1 :]],
+                    [item[2] for item in pending[index + 1 :]],
                     "blocked after ambiguous earlier chunk",
                 )
                 if delivered:
-                    return _partial_result(delivered, [item[0] for item in pending])
+                    return _partial_result(
+                        delivered,
+                        [item[0] for item in pending],
+                        delivered_characters=pending[index - 1][4],
+                    )
                 return SendResult(
                     success=False,
                     error="VK delivery timed out after the request may have started",
@@ -248,6 +354,40 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     raw_response={"delivery_unknown": True, "outbox_id": record.id},
                 )
             index += 1
+        return SendResult(
+            success=True,
+            message_id=delivered[-1] if delivered else None,
+            continuation_message_ids=tuple(delivered[:-1]),
+            retryable=False,
+        )
+
+    async def _send_table_segment(
+        self,
+        peer_id: int,
+        table: RenderedTableSegment,
+        reply_to: str | None,
+    ) -> SendResult:
+        delivered: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="hermes-vk-table-") as directory:
+                paths = await asyncio.to_thread(render_table_jpegs, table, Path(directory))
+                for path in paths:
+                    attachment = await self._upload_photo(peer_id, path)
+                    result = await self._send_direct(
+                        peer_id,
+                        "",
+                        reply_to=reply_to if not delivered else None,
+                        attachment=attachment,
+                    )
+                    if not result.success:
+                        if delivered:
+                            return _partial_result(delivered, [path.name for path in paths])
+                        return result
+                    delivered.extend(_send_result_ids(result))
+        except Exception as exc:  # noqa: BLE001 - media delivery follows the existing upload contract
+            if delivered:
+                return _partial_result(delivered, [table.fallback_text, type(exc).__name__])
+            return SendResult(success=False, error=f"VK table JPEG failed: {type(exc).__name__}", retryable=False)
         return SendResult(
             success=True,
             message_id=delivered[-1] if delivered else None,
@@ -331,6 +471,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
                         "message": record.wire_content,
                         "random_id": record.random_id,
                         "reply_to": int(record.reply_target) if record.reply_target else None,
+                        "format_data": _format_data_json(record.format_data),
+                        "disable_mentions": self.settings.formatting.disable_mentions,
+                        "dont_parse_links": not self.settings.formatting.parse_link_previews,
                     }
                 )
                 await self._storage.mark_outbox(record.id, "sent", message_id=_message_id(response))
@@ -353,7 +496,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 )
                 blocked_invocations.add(record.invocation_id)
 
-    async def edit_message(
+    async def edit_message(  # noqa: C901, PLR0911 - edit delivery has distinct partial/ambiguous outcomes
         self,
         chat_id: str,
         message_id: str,
@@ -364,6 +507,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
         rendered = self._renderer.render_markdown(content)
+        if finalize and any(not isinstance(segment, RenderedTextSegment) for segment in rendered.segments):
+            result = await self.send(chat_id, content)
+            if result.success and _partial_delivery_payload(result) is None:
+                await self.delete_message(chat_id, message_id)
+            return result
+        rendered_text_segments = [segment for segment in rendered.segments if isinstance(segment, RenderedTextSegment)]
+        source_offsets = rendered_text_segments[0].source_offsets if len(rendered_text_segments) == 1 else None
         wire_chunks = split_message_with_spans(rendered.text, self._effective_limit)
         chunks = [chunk.text for chunk in wire_chunks]
         if len(chunks) != 1 and not finalize:
@@ -372,7 +522,16 @@ class VkCommunityAdapter(BasePlatformAdapter):
         try:
             await self._client.call(
                 "messages.edit",
-                {"peer_id": int(chat_id), "message_id": int(message_id), "message": chunks[0]},
+                {
+                    "peer_id": int(chat_id),
+                    "message_id": int(message_id),
+                    "message": chunks[0],
+                    "format_data": _format_data_json(
+                        format_data_for_chunk(rendered.format_data, wire_chunks[0]) if wire_chunks else None
+                    ),
+                    "disable_mentions": self.settings.formatting.disable_mentions,
+                    "dont_parse_links": not self.settings.formatting.parse_link_previews,
+                },
             )
         except VkApiError as exc:
             if exc.code == VK_TOO_LONG_ERROR and self._effective_limit > MIN_MESSAGE_LIMIT:
@@ -387,18 +546,39 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     finalize=finalize,
                 )
             return _api_error_result(exc)
+        except Exception as exc:  # noqa: BLE001 - edit may already have reached VK
+            return SendResult(
+                success=False,
+                error=f"VK edit failed after request start: {type(exc).__name__}",
+                retryable=False,
+                error_kind="unknown",
+                raw_response={"delivery_unknown": True},
+            )
         if len(chunks) == 1:
             return SendResult(success=True, message_id=message_id)
         continuation_ids: list[str] = []
         delivered_rendered_end = wire_chunks[0].end
         for chunk_index, chunk in enumerate(chunks[1:], start=1):
-            result = await self.send(chat_id, chunk)
-            if not result.success:
+            chunk_format = format_data_for_chunk(rendered.format_data, wire_chunks[chunk_index])
+            result = await self._send_text_segment(
+                int(chat_id),
+                RenderedTextSegment(chunk, chunk_format),
+                None,
+            )
+            result_ids = _send_result_ids(result)
+            continuation_ids.extend(result_ids)
+            partial_delivery = _partial_delivery_payload(result)
+            if not result.success or partial_delivery is not None:
+                partial_characters = (partial_delivery or {}).get("delivered_characters")
+                if isinstance(partial_characters, int) and not isinstance(partial_characters, bool):
+                    delivered_rendered_end = wire_chunks[chunk_index].start + partial_characters
                 delivered_prefix = _source_prefix_for_rendered(
                     content,
-                    rendered.text,
+                    source_offsets,
                     delivered_rendered_end,
                 )
+                if not content.startswith(delivered_prefix):
+                    delivered_prefix = ""
                 return SendResult(
                     success=False,
                     error="overflow_continuation_failed",
@@ -413,18 +593,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
                         "delivered_prefix": delivered_prefix,
                     },
                 )
-            raw_continuations = cast(
-                "tuple[object, ...]",
-                result.continuation_message_ids,  # pyright: ignore[reportUnknownMemberType]
-            )
-            continuation_ids.extend(str(value) for value in raw_continuations)
-            if result.message_id:
-                continuation_ids.append(result.message_id)
             delivered_rendered_end = wire_chunks[chunk_index].end
         return SendResult(
             success=True,
             message_id=continuation_ids[-1],
-            continuation_message_ids=tuple(continuation_ids),
+            continuation_message_ids=tuple(continuation_ids[:-1]),
             retryable=False,
         )
 
@@ -433,8 +606,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
         return False
 
     def prefers_fresh_final_streaming(self, content: str, metadata: dict[str, Any] | None = None) -> bool:
-        del content, metadata
-        return False
+        del metadata
+        rendered = self._renderer.render_markdown(content)
+        return any(not isinstance(segment, RenderedTextSegment) for segment in rendered.segments)
 
     async def send_clarify(  # noqa: PLR0913 - exact Hermes compatibility contract
         self,
@@ -805,7 +979,12 @@ class VkCommunityAdapter(BasePlatformAdapter):
         elif response.failed == 3:  # noqa: PLR2004 - VK protocol failure code
             self._lease = await client.get_long_poll_lease(self.settings.group_id)
             await storage.admit_batch(self.settings.group_id, [], self._lease.ts)
-            logger.warning("[vk] Long Poll history gap reported for group %s", self.settings.group_id)
+            self._history_gap_count += 1
+            logger.warning(
+                "[vk] Long Poll history gap reported for group %s (history_gap_count=%d)",
+                self.settings.group_id,
+                self._history_gap_count,
+            )
         elif response.failed is not None:
             _raise_unsupported_failure(response.failed)
         elif response.ts is not None:
@@ -1053,6 +1232,10 @@ async def _convert_voice_to_ogg(source: Path, destination: Path, timeout_seconds
         str(source),
         "-map",
         "0:a:0",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
         "-c:a",
         "libopus",
         str(destination),
@@ -1097,49 +1280,61 @@ def _safe_api_error(exc: VkApiError) -> str:
     return messages.get(exc.code, f"VK rejected the request (error {exc.code}).")
 
 
-def _partial_result(delivered: list[str], chunks: list[str]) -> SendResult:
+def _partial_result(
+    delivered: list[str],
+    chunks: list[str],
+    *,
+    delivered_characters: int | None = None,
+) -> SendResult:
+    partial: dict[str, object] = {
+        "delivered_chunks": len(delivered),
+        "total_chunks": len(chunks),
+        "missing_tail_sha256": hashlib.sha256("".join(chunks[len(delivered) :]).encode()).hexdigest(),
+    }
+    if delivered_characters is not None:
+        partial["delivered_characters"] = delivered_characters
     return SendResult(
         success=True,
         message_id=delivered[-1],
         continuation_message_ids=tuple(delivered[:-1]),
         retryable=False,
-        raw_response={
-            "partial_delivery": {
-                "delivered_chunks": len(delivered),
-                "total_chunks": len(chunks),
-                "missing_tail_sha256": hashlib.sha256("".join(chunks[len(delivered) :]).encode()).hexdigest(),
-            }
-        },
+        raw_response={"partial_delivery": partial},
     )
 
 
-def _source_prefix_for_rendered(source: str, rendered: str, rendered_end: int) -> str:
-    """Map a delivered rendered offset to a conservative literal source prefix."""
-    target = max(0, min(rendered_end, len(rendered)))
-    source_end = 0
-    for tag, source_start, source_stop, rendered_start, rendered_stop in difflib.SequenceMatcher(
-        None,
-        source,
-        rendered,
-        autojunk=False,
-    ).get_opcodes():
-        if rendered_start > target:
-            break
-        if tag == "delete":
-            if rendered_start <= target:
-                source_end = source_stop
-            continue
-        if target >= rendered_stop:
-            source_end = source_stop
-            continue
-        if tag == "equal":
-            source_end = source_start + max(0, target - rendered_start)
-        elif tag == "replace" and rendered_stop > rendered_start:
-            consumed = max(0, target - rendered_start)
-            source_width = source_stop - source_start
-            rendered_width = rendered_stop - rendered_start
-            source_end = source_start + min(source_width, consumed * source_width // rendered_width)
-        break
+def _format_data_json(format_data: dict[str, object] | None) -> str | None:
+    return json.dumps(format_data, ensure_ascii=False, separators=(",", ":")) if format_data else None
+
+
+def _send_result_ids(result: SendResult) -> list[str]:
+    continuations = cast(
+        "tuple[object, ...]",
+        result.continuation_message_ids,  # pyright: ignore[reportUnknownMemberType]
+    )
+    values = [str(value) for value in continuations]
+    if result.message_id:
+        values.append(str(result.message_id))
+    return values
+
+
+def _partial_delivery_payload(result: SendResult) -> dict[str, object] | None:
+    raw = result.raw_response
+    if not isinstance(raw, dict):
+        return None
+    partial = cast("dict[str, object]", raw).get("partial_delivery")
+    return cast("dict[str, object]", partial) if isinstance(partial, dict) else None
+
+
+def _source_prefix_for_rendered(
+    source: str,
+    source_offsets: tuple[int, ...] | None,
+    rendered_end: int,
+) -> str:
+    """Return the AST renderer's exact literal source span for a rendered boundary."""
+    if source_offsets is None or not source_offsets:
+        return ""
+    boundary = max(0, min(rendered_end, len(source_offsets) - 1))
+    source_end = max(0, min(source_offsets[boundary], len(source)))
     while source_end < len(source) and source[source_end].isspace():
         source_end += 1
     return source[:source_end]

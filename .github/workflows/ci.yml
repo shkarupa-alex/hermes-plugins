@@ -6,6 +6,22 @@ on:
     branches: [develop, main]
 
 jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Audit locked production dependencies
+        run: |
+          uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
+          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip
+      - name: Scan repository history for secrets
+        uses: gitleaks/gitleaks-action@v2
+
   quality:
     runs-on: ubuntu-latest
     steps:

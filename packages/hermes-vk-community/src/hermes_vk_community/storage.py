@@ -5,7 +5,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import aiosqlite
 
@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 
 InboxState = Literal["received", "dispatched", "completed", "quarantined"]
 MAX_NORMALIZED_JSON_LENGTH = 262_144
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+PREVIOUS_SCHEMA_VERSION = 2
 UPDATE_FIELDS = ("type", "object", "group_id", "event_id")
 
 SCHEMA = """
@@ -24,7 +25,7 @@ CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   version INTEGER NOT NULL
 );
-INSERT INTO schema_meta(singleton, version) VALUES(1, 2);
+INSERT INTO schema_meta(singleton, version) VALUES(1, 3);
 CREATE TABLE long_poll_cursor (
   group_id INTEGER PRIMARY KEY,
   ts TEXT NOT NULL,
@@ -63,6 +64,7 @@ CREATE TABLE outbox (
   attempt_count INTEGER NOT NULL DEFAULT 0,
   returned_message_id TEXT,
   wire_content TEXT CHECK(wire_content IS NULL OR length(wire_content) <= 262144),
+  format_data_json TEXT CHECK(format_data_json IS NULL OR length(format_data_json) <= 262144),
   error TEXT CHECK(error IS NULL OR length(error) <= 2048),
   created_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
@@ -106,6 +108,7 @@ class OutboxRecord:
     random_id: int
     wire_content: str = ""
     reply_target: str | None = None
+    format_data: dict[str, object] | None = None
 
 
 def canonical_json(value: object) -> str:
@@ -169,6 +172,19 @@ class VkStorage:
                     "created_at_ms INTEGER NOT NULL)"
                 )
                 await db.execute("UPDATE schema_meta SET version=2 WHERE singleton=1")
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            row = (PREVIOUS_SCHEMA_VERSION,)
+        if row is not None and int(row[0]) == PREVIOUS_SCHEMA_VERSION:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute(
+                    "ALTER TABLE outbox ADD COLUMN format_data_json TEXT "
+                    "CHECK(format_data_json IS NULL OR length(format_data_json) <= 262144)"
+                )
+                await db.execute("UPDATE schema_meta SET version=3 WHERE singleton=1")
                 await db.commit()
             except BaseException:
                 await db.rollback()
@@ -290,20 +306,25 @@ class VkStorage:
         reply_target: str | None,
         *,
         recoverable: bool = True,
+        format_data: list[dict[str, object] | None] | None = None,
     ) -> list[OutboxRecord]:
         db = self._connection()
         invocation_id = uuid.uuid4().hex
         now = _now_ms()
         records: list[OutboxRecord] = []
+        formats = format_data or [None] * len(chunks)
+        if len(formats) != len(chunks):
+            raise ValueError("format_data must align with chunks")
         await db.execute("BEGIN IMMEDIATE")
         try:
-            for index, chunk in enumerate(chunks):
+            for index, (chunk, chunk_format) in enumerate(zip(chunks, formats, strict=True)):
+                format_json = canonical_json(chunk_format) if chunk_format else None
                 while True:
                     random_id = secrets.randbelow(2_147_483_647) + 1
                     cursor = await db.execute(
                         """INSERT OR IGNORE INTO outbox(invocation_id,peer_id,content_sha256,chunk_index,
-                        random_id,reply_target,state,wire_content,created_at_ms,updated_at_ms)
-                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        random_id,reply_target,state,wire_content,format_data_json,created_at_ms,updated_at_ms)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             invocation_id,
                             peer_id,
@@ -313,6 +334,7 @@ class VkStorage:
                             reply_target,
                             "prepared" if recoverable else "sending",
                             chunk,
+                            format_json,
                             now,
                             now,
                         ),
@@ -327,6 +349,7 @@ class VkStorage:
                                 random_id,
                                 chunk,
                                 reply_target,
+                                chunk_format,
                             )
                         )
                         break
@@ -339,7 +362,7 @@ class VkStorage:
     async def prepared_outbox(self) -> list[OutboxRecord]:
         db = self._connection()
         async with db.execute(
-            "SELECT id,invocation_id,peer_id,chunk_index,random_id,wire_content,reply_target "
+            "SELECT id,invocation_id,peer_id,chunk_index,random_id,wire_content,reply_target,format_data_json "
             "FROM outbox WHERE state='prepared' AND wire_content IS NOT NULL ORDER BY id"
         ) as cursor:
             rows = await cursor.fetchall()
@@ -352,6 +375,7 @@ class VkStorage:
                 random_id=int(row[4]),
                 wire_content=str(row[5]),
                 reply_target=str(row[6]) if row[6] is not None else None,
+                format_data=cast("dict[str, object]", json.loads(str(row[7]))) if row[7] is not None else None,
             )
             for row in rows
         ]

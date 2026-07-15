@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import aiosqlite
 import pytest
 
 from hermes_vk_community.storage import MAX_NORMALIZED_JSON_LENGTH, VkStorage, canonical_json
@@ -95,6 +96,65 @@ async def test_prepared_outbox_retains_recoverable_wire_payload(tmp_path: Path) 
     assert recovered.wire_content == "hello"
     assert recovered.reply_target == "7"
     await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_random_id_collision_is_rejected_and_resampled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    samples = iter([40, 40, 41])
+
+    def next_random_id(_limit: int) -> int:
+        return next(samples)
+
+    monkeypatch.setattr("hermes_vk_community.storage.secrets.randbelow", next_random_id)
+    first = (await storage.prepare_outbox(2, ["first"], None))[0]
+    second = (await storage.prepare_outbox(2, ["second"], None))[0]
+    assert first.random_id == 41
+    assert second.random_id == 42
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_outbox_retains_format_data(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    rich: dict[str, object] = {
+        "version": 1,
+        "items": [{"type": "bold", "offset": 0, "length": 5}],
+    }
+    await storage.prepare_outbox(2, ["hello"], None, format_data=[rich])
+    recovered = (await storage.prepared_outbox())[0]
+    assert recovered.format_data == rich
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_schema_v2_migrates_format_data_column(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    storage = VkStorage(path)
+    await storage.open()
+    await storage.close()
+
+    legacy = await aiosqlite.connect(path)
+    await legacy.execute("ALTER TABLE outbox DROP COLUMN format_data_json")
+    await legacy.execute("UPDATE schema_meta SET version=2 WHERE singleton=1")
+    await legacy.commit()
+    await legacy.close()
+
+    migrated = VkStorage(path)
+    await migrated.open()
+    db = migrated._connection()
+    async with db.execute("PRAGMA table_info(outbox)") as cursor:
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+    assert "format_data_json" in columns
+    async with db.execute("SELECT version FROM schema_meta WHERE singleton=1") as cursor:
+        row = await cursor.fetchone()
+    assert row == (3,)
+    await migrated.close()
 
 
 @pytest.mark.asyncio
