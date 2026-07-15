@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-vk-community"
-version = "1.0.2"
+version = "1.0.3"
 description = "VK Community Long Poll platform plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

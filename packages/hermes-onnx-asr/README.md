@@ -17,11 +17,33 @@ Hermes `0.18.2` сам фиксирует `cryptography==46.0.7` и `Pillow==12.
 
 ## Установка
 
+Из PyPI:
+
 ```bash
 pip install hermes-onnx-asr
 hermes plugins enable onnx-asr
+```
+
+Либо напрямую из подкаталога GitHub-репозитория:
+
+```bash
+hermes plugins install shkarupa-alex/hermes-plugins/packages/hermes-onnx-asr --enable
+```
+
+Во втором варианте Hermes клонирует только каталог плагина. При первой
+фактической загрузке плагин проверяет зависимости из `pyproject.toml` и при
+необходимости устанавливает их через `uv` в то же виртуальное окружение, где
+работает Hermes. Повторная загрузка ничего не переустанавливает. Автоустановку
+можно запретить штатной настройкой Hermes `security.allow_lazy_installs: false`
+или переменной `HERMES_DISABLE_LAZY_INSTALLS=1`; тогда сообщение об ошибке
+покажет точную команду для ручной установки зависимостей.
+
+После любого варианта установки:
+
+```bash
 hermes onnx-asr setup
 hermes onnx-asr doctor
+hermes gateway restart
 ```
 
 Мастер записывает настройки в активный профиль Hermes. API-ключи не нужны.
