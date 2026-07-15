@@ -1155,7 +1155,14 @@ class VkCommunityAdapter(BasePlatformAdapter):
             paths.append(cached.path)
             media_types.append(cached.media_type)
             voice_flags.append(voice)
-            descriptions.append(cached.context_note())
+            # Voice media is consumed by Hermes' STT pipeline through
+            # ``media_urls``.  Adding the generic cached-file note to the
+            # event text as well leaves an audio path beside the completed
+            # transcript and can make the agent try to transcribe it again.
+            # Keep notes for ordinary attachments, but make voice events
+            # match Telegram's transcript-only agent input.
+            if not voice:
+                descriptions.append(cached.context_note())
             is_voice = is_voice or voice
         if is_voice:
             voice_media = [
