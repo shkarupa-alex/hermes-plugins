@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Audit locked production dependencies
+        run: |
+          uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
+          # hermes-agent 0.18.2 pins these exact vulnerable versions. Keep the
+          # exceptions narrow and remove them as soon as upstream publishes a
+          # compatible release with cryptography>=48.0.1 and Pillow>=12.3.0.
+          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip \
+            --ignore-vuln GHSA-537c-gmf6-5ccf \
+            --ignore-vuln PYSEC-2026-2253 \
+            --ignore-vuln PYSEC-2026-2254 \
+            --ignore-vuln PYSEC-2026-2255 \
+            --ignore-vuln PYSEC-2026-2256 \
+            --ignore-vuln PYSEC-2026-2257
+      - name: Scan repository history for secrets
+        uses: gitleaks/gitleaks-action@v2
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run pyright
+      - run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
+      - run: uv build --all-packages
+
+  os-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: windows-2022
+            python: "3.13"
+          - os: macos-15-intel
+            python: "3.13"
+          - os: macos-15-arm64
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --all-packages --locked
+      - run: uv run pytest -q
+
+  hermes-compatibility:
+    strategy:
+      matrix:
+        hermes: ["0.18.2", "latest-supported"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - if: matrix.hermes == '0.18.2'
+        run: uv pip install "hermes-agent==${{ matrix.hermes }}"
+      - if: matrix.hermes == 'latest-supported'
+        run: uv pip install --upgrade "hermes-agent>=0.18.2,<0.19"
+      - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
+
+  hermes-main-warning:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-packages --locked
+      - run: uv pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main"
+      - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests

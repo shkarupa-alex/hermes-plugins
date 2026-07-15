@@ -1,0 +1,85 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-gates:
+    uses: ./.github/workflows/release-gates.yml
+    secrets: inherit
+
+  release-build:
+    runs-on: ubuntu-latest
+    needs: release-gates
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Verify tag matches every package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
+          package_files = sorted(Path("packages").glob("*/pyproject.toml"))
+          versions = {
+              tomllib.loads(path.read_text(encoding="utf-8"))["project"]["name"]:
+              tomllib.loads(path.read_text(encoding="utf-8"))["project"]["version"]
+              for path in package_files
+          }
+          mismatches = {name: version for name, version in versions.items() if version != expected}
+          if mismatches:
+              details = ", ".join(f"{name}={version}" for name, version in sorted(mismatches.items()))
+              raise SystemExit(f"tag {os.environ['RELEASE_TAG']} does not match package versions: {details}")
+          print(f"release version {expected}: {', '.join(sorted(versions))}")
+          PY
+
+      - name: Build release distributions
+        run: uv build --all-packages --out-dir dist --clear
+
+      - name: Upload release distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dists
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  pypi-publish:
+    runs-on: ubuntu-latest
+    needs: release-build
+    permissions:
+      id-token: write
+
+    environment:
+      name: pypi
+
+    steps:
+      - name: Retrieve release distributions
+        uses: actions/download-artifact@v5
+        with:
+          name: release-dists
+          path: dist/
+
+      - name: Publish release distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          print-hash: true

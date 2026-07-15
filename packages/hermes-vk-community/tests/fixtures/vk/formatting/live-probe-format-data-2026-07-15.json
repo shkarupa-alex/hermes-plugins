@@ -1,0 +1,384 @@
+{
+  "schema_version": 1,
+  "api_version": "5.199",
+  "peer_id": "<redacted>",
+  "generated_at": "2026-07-15T11:50:12.053225+00:00",
+  "cases": [
+    {
+      "name": "plain",
+      "operation": "send+readback",
+      "request_message": "Обычный текст: Кириллица 😀 & < >",
+      "request_length": 32,
+      "request_sha256": "d1e2f0fe7bd14272e9e89966c24ac2e2a4fd1e5e20fc80fdda115765fd36ebe8",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "Обычный текст: Кириллица 😀 & < >",
+      "readback_length": 32,
+      "readback_sha256": "d1e2f0fe7bd14272e9e89966c24ac2e2a4fd1e5e20fc80fdda115765fd36ebe8",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "edit",
+      "operation": "edit+readback",
+      "request_message": "Жирное редактирование",
+      "request_length": 21,
+      "request_sha256": "e18c5a1d4a9ea76681bf816bd4c6959cfe4ba7713aaaa73018f3f78181687d73",
+      "request_format_data": {
+        "version": 1,
+        "items": [
+          {
+            "type": "bold",
+            "offset": 0,
+            "length": 6
+          }
+        ]
+      },
+      "send_status": "accepted",
+      "readback_text": "Жирное редактирование",
+      "readback_length": 21,
+      "readback_sha256": "e18c5a1d4a9ea76681bf816bd4c6959cfe4ba7713aaaa73018f3f78181687d73",
+      "readback_format_data": {
+        "version": "1",
+        "items": [
+          {
+            "offset": 0,
+            "length": 6,
+            "type": "bold"
+          }
+        ]
+      },
+      "error_code": null
+    },
+    {
+      "name": "format_data_basic",
+      "operation": "send+readback",
+      "request_message": "Жирный курсив подчёркнутый ссылка",
+      "request_length": 33,
+      "request_sha256": "52fd846a7204fd8122711b5e0d7be1c7c79c5330eb796cfac3161e3c69d1fbe5",
+      "request_format_data": {
+        "version": 1,
+        "items": [
+          {
+            "type": "bold",
+            "offset": 0,
+            "length": 6
+          },
+          {
+            "type": "italic",
+            "offset": 7,
+            "length": 6
+          },
+          {
+            "type": "underline",
+            "offset": 14,
+            "length": 12
+          },
+          {
+            "type": "url",
+            "offset": 27,
+            "length": 6,
+            "url": "https://example.com/"
+          }
+        ]
+      },
+      "send_status": "accepted",
+      "readback_text": "Жирный курсив подчёркнутый ссылка",
+      "readback_length": 33,
+      "readback_sha256": "52fd846a7204fd8122711b5e0d7be1c7c79c5330eb796cfac3161e3c69d1fbe5",
+      "readback_format_data": {
+        "version": "1",
+        "items": [
+          {
+            "offset": 0,
+            "length": 6,
+            "type": "bold"
+          },
+          {
+            "offset": 7,
+            "length": 6,
+            "type": "italic"
+          },
+          {
+            "offset": 14,
+            "length": 12,
+            "type": "underline"
+          },
+          {
+            "offset": 27,
+            "length": 6,
+            "type": "url",
+            "url": "https://example.com/"
+          }
+        ]
+      },
+      "error_code": null
+    },
+    {
+      "name": "format_data_nested_same_boundary",
+      "operation": "send+readback",
+      "request_message": "Жирный курсив",
+      "request_length": 13,
+      "request_sha256": "bef2126a96ee64a8824565e836707daf30415df5314b66ea1c84b730094934fb",
+      "request_format_data": {
+        "version": 1,
+        "items": [
+          {
+            "type": "bold",
+            "offset": 0,
+            "length": 13
+          },
+          {
+            "type": "italic",
+            "offset": 7,
+            "length": 6
+          }
+        ]
+      },
+      "send_status": "accepted",
+      "readback_text": "Жирный курсив",
+      "readback_length": 13,
+      "readback_sha256": "bef2126a96ee64a8824565e836707daf30415df5314b66ea1c84b730094934fb",
+      "readback_format_data": {
+        "version": "1",
+        "items": [
+          {
+            "offset": 0,
+            "length": 13,
+            "type": "bold"
+          },
+          {
+            "offset": 7,
+            "length": 6,
+            "type": "italic"
+          }
+        ]
+      },
+      "error_code": null
+    },
+    {
+      "name": "format_data_partial_overlap",
+      "operation": "send+readback",
+      "request_message": "частичный overlap",
+      "request_length": 17,
+      "request_sha256": "d86c12882756addf40b0549be2829ee30d189fec2b0509659152e49dd8896660",
+      "request_format_data": {
+        "version": 1,
+        "items": [
+          {
+            "type": "bold",
+            "offset": 0,
+            "length": 9
+          },
+          {
+            "type": "italic",
+            "offset": 5,
+            "length": 12
+          }
+        ]
+      },
+      "send_status": "accepted",
+      "readback_text": "частичный overlap",
+      "readback_length": 17,
+      "readback_sha256": "d86c12882756addf40b0549be2829ee30d189fec2b0509659152e49dd8896660",
+      "readback_format_data": {
+        "version": "1",
+        "items": [
+          {
+            "offset": 0,
+            "length": 9,
+            "type": "bold"
+          },
+          {
+            "offset": 5,
+            "length": 12,
+            "type": "italic"
+          }
+        ]
+      },
+      "error_code": null
+    },
+    {
+      "name": "format_data_unicode_codepoints",
+      "operation": "send+readback",
+      "request_message": "😀 Жирный é",
+      "request_length": 11,
+      "request_sha256": "3767015aeabd7cb3b908e1a4d9d2b47de41fa6c78722d9a642d33d261a2f5d85",
+      "request_format_data": {
+        "version": 1,
+        "items": [
+          {
+            "type": "bold",
+            "offset": 2,
+            "length": 6
+          },
+          {
+            "type": "underline",
+            "offset": 9,
+            "length": 2
+          }
+        ]
+      },
+      "send_status": "accepted",
+      "readback_text": "😀 Жирный é",
+      "readback_length": 11,
+      "readback_sha256": "3767015aeabd7cb3b908e1a4d9d2b47de41fa6c78722d9a642d33d261a2f5d85",
+      "readback_format_data": {
+        "version": "1",
+        "items": [
+          {
+            "offset": 2,
+            "length": 6,
+            "type": "bold"
+          },
+          {
+            "offset": 9,
+            "length": 2,
+            "type": "underline"
+          }
+        ]
+      },
+      "error_code": null
+    },
+    {
+      "name": "format_data_unicode_utf16",
+      "operation": "send+readback",
+      "request_message": "😀 Жирный é",
+      "request_length": 11,
+      "request_sha256": "3767015aeabd7cb3b908e1a4d9d2b47de41fa6c78722d9a642d33d261a2f5d85",
+      "request_format_data": {
+        "version": 1,
+        "items": [
+          {
+            "type": "bold",
+            "offset": 3,
+            "length": 6
+          },
+          {
+            "type": "underline",
+            "offset": 10,
+            "length": 2
+          }
+        ]
+      },
+      "send_status": "accepted",
+      "readback_text": "😀 Жирный é",
+      "readback_length": 11,
+      "readback_sha256": "3767015aeabd7cb3b908e1a4d9d2b47de41fa6c78722d9a642d33d261a2f5d85",
+      "readback_format_data": {
+        "version": "1",
+        "items": [
+          {
+            "offset": 3,
+            "length": 6,
+            "type": "bold"
+          },
+          {
+            "offset": 10,
+            "length": 2,
+            "type": "underline"
+          }
+        ]
+      },
+      "error_code": null
+    },
+    {
+      "name": "html",
+      "operation": "send+readback",
+      "request_message": "<b>Жирный</b> <i>курсив</i> <u>подчёркнутый</u>",
+      "request_length": 47,
+      "request_sha256": "51ddb6376c4bc9aa28df6448c2031dd91b81400fb9f2222e8999d64ddeb33352",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "<b>Жирный</b> <i>курсив</i> <u>подчёркнутый</u>",
+      "readback_length": 47,
+      "readback_sha256": "51ddb6376c4bc9aa28df6448c2031dd91b81400fb9f2222e8999d64ddeb33352",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "link",
+      "operation": "send+readback",
+      "request_message": "<a href=\"https://example.com/\">ссылка</a>",
+      "request_length": 41,
+      "request_sha256": "44cdc0bce9821bc96ee93e60f05251623e97f40f1aa79ed9eed679673b7b3602",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "<a href=\"https://example.com/\">ссылка</a>",
+      "readback_length": 41,
+      "readback_sha256": "44cdc0bce9821bc96ee93e60f05251623e97f40f1aa79ed9eed679673b7b3602",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "markdown",
+      "operation": "send+readback",
+      "request_message": "**Жирный Markdown** и *курсив*, `код`, ~~strike~~",
+      "request_length": 49,
+      "request_sha256": "e64efe8846f05f8e08cf3c8773ad1e189ae841b0ed9ee7229853d32f0b1765a2",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "**Жирный Markdown** и *курсив*, `код`, ~~strike~~",
+      "readback_length": 49,
+      "readback_sha256": "e64efe8846f05f8e08cf3c8773ad1e189ae841b0ed9ee7229853d32f0b1765a2",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "nested_malformed",
+      "operation": "send+readback",
+      "request_message": "<b>жирный <i>вложенный</b> хвост</i> <broken>",
+      "request_length": 45,
+      "request_sha256": "7dec05502bb997a142f05e01c7e8dbe39207e456f1fc90539fb567693305af37",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "<b>жирный <i>вложенный</b> хвост</i> <broken>",
+      "readback_length": 45,
+      "readback_sha256": "7dec05502bb997a142f05e01c7e8dbe39207e456f1fc90539fb567693305af37",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "quote_list",
+      "operation": "send+readback",
+      "request_message": "> цитата\n\n• первый пункт\n• второй пункт",
+      "request_length": 39,
+      "request_sha256": "48415a3ba11be3d8909d581b488b82b1fbb1bb40085141cb6237d0163df046bb",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "> цитата\n\n• первый пункт\n• второй пункт",
+      "readback_length": 39,
+      "readback_sha256": "48415a3ba11be3d8909d581b488b82b1fbb1bb40085141cb6237d0163df046bb",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "table",
+      "operation": "send+readback",
+      "request_message": "<table><tr><th>A</th><th>Б</th></tr><tr><td>1</td><td>😀</td></tr></table>",
+      "request_length": 73,
+      "request_sha256": "7158749232e04bb4b8b995a00ed270226ade95a7a0c8cea4eafee74846af91ca",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "<table><tr><th>A</th><th>Б</th></tr><tr><td>1</td><td>😀</td></tr></table>",
+      "readback_length": 73,
+      "readback_sha256": "7158749232e04bb4b8b995a00ed270226ade95a7a0c8cea4eafee74846af91ca",
+      "readback_format_data": null,
+      "error_code": null
+    },
+    {
+      "name": "long_4096",
+      "operation": "send+readback",
+      "request_message": "<redacted generated payload: 4096 characters>",
+      "request_length": 4096,
+      "request_sha256": "ef914c948bb0429813e08956495c63f0c878b293c60c441f0897983a6556c460",
+      "request_format_data": null,
+      "send_status": "accepted",
+      "readback_text": "<redacted generated payload: 4096 characters>",
+      "readback_length": 4096,
+      "readback_sha256": "ef914c948bb0429813e08956495c63f0c878b293c60c441f0897983a6556c460",
+      "readback_format_data": null,
+      "error_code": null
+    }
+  ]
+}

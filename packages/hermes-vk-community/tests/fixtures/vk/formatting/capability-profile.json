@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "api_version": "5.199",
+  "tested_at": "2026-07-15",
+  "profile": "format-data-v1",
+  "rich_send": true,
+  "rich_edit": true,
+  "format_data_observed": true,
+  "send_limit": 4096,
+  "edit_limit": 4096,
+  "offset_unit": "unicode_codepoints",
+  "nested_ranges": "properly_nested",
+  "overlapping_ranges": "accepted_transport_inbound_plain_fallback",
+  "supported_format_types": ["bold", "italic", "underline", "url"],
+  "typing_indicator_visible": true,
+  "observations": {
+    "html": "rendered literally",
+    "format_data": "bold, italic, underline and url ranges rendered in VK Web",
+    "offset_probe": "unicode-codepoint and UTF-16 candidates both rendered the intended emoji-adjacent bold and underline ranges; runtime emits certified Unicode codepoint offsets",
+    "markdown": "compiled locally; raw Markdown is rendered literally",
+    "quote": "Unicode bar plus italic format_data",
+    "lists": "Unicode bullets or numbers with indentation",
+    "table": "rendered locally and uploaded as one or more JPEG photos",
+    "standalone_image": "uploaded as a VK photo attachment",
+    "mixed_content": "sent as ordered text and photo messages",
+    "bare_url": "clickable",
+    "bullet_list": "compact without extra blank lines"
+  },
+  "clients": [
+    {
+      "name": "VK Web",
+      "version": "not exposed by client UI during manual observation",
+      "manual_visual_check": true
+    }
+  ]
+}
