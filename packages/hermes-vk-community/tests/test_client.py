@@ -1,5 +1,6 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
+import os
 import stat
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Self, cast
@@ -31,7 +32,8 @@ async def test_media_download_streams_to_private_temp_file() -> None:
     downloaded = DownloadedMedia(path, "text/plain", "https://example.invalid/media")
     try:
         assert path.read_bytes() == b"hello world"
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
     finally:
         downloaded.cleanup()
     assert not path.exists()

@@ -17,7 +17,16 @@ jobs:
       - name: Audit locked production dependencies
         run: |
           uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
-          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip
+          # hermes-agent 0.18.2 pins these exact vulnerable versions. Keep the
+          # exceptions narrow and remove them as soon as upstream publishes a
+          # compatible release with cryptography>=48.0.1 and Pillow>=12.3.0.
+          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip \
+            --ignore-vuln GHSA-537c-gmf6-5ccf \
+            --ignore-vuln PYSEC-2026-2253 \
+            --ignore-vuln PYSEC-2026-2254 \
+            --ignore-vuln PYSEC-2026-2255 \
+            --ignore-vuln PYSEC-2026-2256 \
+            --ignore-vuln PYSEC-2026-2257
       - name: Scan repository history for secrets
         uses: gitleaks/gitleaks-action@v2
 
@@ -25,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
+        os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15-arm64]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

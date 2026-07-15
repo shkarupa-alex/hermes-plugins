@@ -228,7 +228,10 @@ def _write_manifest(
         json.dumps(manifest.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-    with manifest_path.open("rb") as handle:
+    # Windows rejects fsync on a read-only descriptor with EBADF. Opening an
+    # existing staging file for update does not modify it and gives fsync the
+    # writable handle it requires there.
+    with manifest_path.open("rb+") as handle:
         os.fsync(handle.fileno())
     return manifest
 
@@ -236,7 +239,7 @@ def _write_manifest(
 def _fsync_files(directory: Path) -> None:
     for path in directory.rglob("*"):
         if path.is_file() and not path.is_symlink():
-            with path.open("rb") as handle:
+            with path.open("rb+") as handle:
                 os.fsync(handle.fileno())
 
 
