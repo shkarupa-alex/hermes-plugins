@@ -14,10 +14,30 @@ Hermes `0.18.2` сам фиксирует `cryptography==46.0.7` и `Pillow==12.
 
 ## Быстрая настройка
 
-После установки плагина включите его и запустите мастер:
+Установить плагин можно из PyPI:
 
 ```bash
+pip install hermes-vk-community
 hermes plugins enable vk-community
+```
+
+Либо напрямую из подкаталога GitHub-репозитория:
+
+```bash
+hermes plugins install shkarupa-alex/hermes-plugins/packages/hermes-vk-community --enable
+```
+
+Во втором варианте Hermes клонирует только каталог плагина. При первой
+фактической загрузке плагин проверяет зависимости из `pyproject.toml` и при
+необходимости устанавливает их через `uv` в то же виртуальное окружение, где
+работает Hermes. Повторная загрузка ничего не переустанавливает. Автоустановку
+можно запретить штатной настройкой Hermes `security.allow_lazy_installs: false`
+или переменной `HERMES_DISABLE_LAZY_INSTALLS=1`; тогда сообщение об ошибке
+покажет точную команду для ручной установки зависимостей.
+
+После установки запустите мастер:
+
+```bash
 hermes gateway setup
 ```
 

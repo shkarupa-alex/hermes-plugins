@@ -1,7 +1,8 @@
 name: vk-community
+manifest_version: 1
 label: VK Community
 kind: platform
-version: 0.1.0
+version: 1.0.3
 description: VK Community Long Poll gateway adapter for Hermes Agent.
 author: Hermes VK Community contributors
 requires_env:
