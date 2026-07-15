@@ -31,6 +31,7 @@ class CatalogEntry(BaseModel):
     quantizations: list[str | None]
     files: dict[str, list[str]]
     download: Literal["huggingface_snapshot"]
+    certified: bool = False
 
     @field_validator("revision")
     @classmethod
@@ -99,6 +100,10 @@ def model_entry(alias: str) -> CatalogEntry:
         if entry.alias == alias:
             return entry
     raise safe_error("model_not_in_catalog")
+
+
+def certified_model_names() -> tuple[str, ...]:
+    return tuple(entry.alias for entry in load_catalog().models if entry.certified)
 
 
 def catalog_entry(alias: str, quantization: str | None, *, kind: Literal["model", "vad"] = "model") -> CatalogEntry:

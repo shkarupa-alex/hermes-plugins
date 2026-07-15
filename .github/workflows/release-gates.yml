@@ -57,7 +57,7 @@ jobs:
           name: asr-corpus-result
           path: release-corpus/result.json
 
-  advertised-model-smoke:
+  upstream-model-smoke:
     strategy:
       fail-fast: false
       matrix:
@@ -68,8 +68,6 @@ jobs:
           - {model: gigaam-v3-rnnt, quantization: int8}
           - {model: gigaam-v3-e2e-ctc, quantization: int8}
           - {model: gigaam-v3-e2e-rnnt, quantization: int8}
-          - {model: gigaam-multilingual-ctc, quantization: int8}
-          - {model: gigaam-multilingual-large-ctc, quantization: int8}
           - {model: nemo-fastconformer-ru-ctc, quantization: int8}
           - {model: nemo-fastconformer-ru-rnnt, quantization: int8}
           - {model: nemo-parakeet-ctc-0.6b, quantization: int8}

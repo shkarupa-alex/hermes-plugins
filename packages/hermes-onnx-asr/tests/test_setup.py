@@ -44,7 +44,7 @@ def test_model_picker_uses_upstream_registry_and_accepts_number(monkeypatch: pyt
     monkeypatch.setattr(setup, "prompt", choose)
     assert setup._select_model() == DEFAULT_MODEL
     assert defaults == ["6"]
-    assert any("gigaam-multilingual-ctc" in line for line in output)
+    assert any("nemo-parakeet-tdt-0.6b-v3" in line for line in output)
     assert any("nemo-canary-1b-v2" in line for line in output)
     assert any("t-tech/t-one" in line for line in output)
 
@@ -55,3 +55,17 @@ def test_t_one_picker_uses_its_only_supported_fp32(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(setup, "print_info", ignore)
     assert setup._select_quantization("t-tech/t-one") is None
+
+
+def test_model_picker_rejects_upstream_model_pending_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
+    def ignore(_message: str) -> None:
+        pass
+
+    def choose(_label: str, *, default: str) -> str:
+        del default
+        return "nemo-canary-1b-v2"
+
+    monkeypatch.setattr(setup, "print_info", ignore)
+    monkeypatch.setattr(setup, "prompt", choose)
+    with pytest.raises(ValueError, match="release smoke"):
+        setup._select_model()

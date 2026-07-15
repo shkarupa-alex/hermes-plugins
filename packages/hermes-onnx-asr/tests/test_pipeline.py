@@ -10,6 +10,7 @@ from hermes_onnx_asr.config import OnnxAsrSettings
 from hermes_onnx_asr.errors import OnnxAsrError
 from hermes_onnx_asr.pipeline import (
     CPU_PROVIDERS,
+    KNOWN_SAMPLE_RATES,
     MODEL_SESSION_ROLES,
     RESAMPLER_RATES,
     audit_cpu_sessions,
@@ -71,6 +72,17 @@ def test_cpu_audit_accepts_nemo_rnnt_role_manifest() -> None:
     model.asr = SimpleNamespace(_encoder=FakeSession(), _decoder_joint=FakeSession())
     audit = audit_cpu_sessions(model, None, model_alias="nemo-fastconformer-ru-rnnt")
     assert {"asr.encoder", "asr.decoder_joint"}.issubset(audit.roles)
+
+
+def test_t_one_uses_8khz_native_rate_and_requires_16khz_resampler() -> None:
+    model = BaseModel()
+    model.asr = SimpleNamespace(_model=FakeSession())
+    model.resampler = SimpleNamespace(
+        _preprocessors={rate: FakeSession() for rate in KNOWN_SAMPLE_RATES if rate != 8000}
+    )
+    audit = audit_cpu_sessions(model, None, model_alias="t-tech/t-one")
+    assert "resampler.16000" in audit.roles
+    assert "resampler.8000" not in audit.roles
 
 
 def test_cpu_audit_rejects_duplicate_and_unknown_sessions() -> None:

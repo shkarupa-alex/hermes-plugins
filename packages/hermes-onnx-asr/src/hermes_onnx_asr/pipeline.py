@@ -19,7 +19,10 @@ if TYPE_CHECKING:
     from hermes_onnx_asr.config import OnnxAsrSettings
 
 CPU_PROVIDERS = ["CPUExecutionProvider"]
-RESAMPLER_RATES = (8000, 11025, 22050, 24000, 32000, 44100, 48000)
+TONE_SAMPLE_RATE = 8000
+DEFAULT_SAMPLE_RATE = 16000
+KNOWN_SAMPLE_RATES = (TONE_SAMPLE_RATE, 11025, DEFAULT_SAMPLE_RATE, 22050, 24000, 32000, 44100, 48000)
+RESAMPLER_RATES = tuple(rate for rate in KNOWN_SAMPLE_RATES if rate != DEFAULT_SAMPLE_RATE)
 MODEL_SESSION_ROLES = {
     "gigaam-v2-ctc": frozenset({"asr.model"}),
     "gigaam-v2-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
@@ -27,8 +30,6 @@ MODEL_SESSION_ROLES = {
     "gigaam-v3-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
     "gigaam-v3-e2e-ctc": frozenset({"asr.model"}),
     "gigaam-v3-e2e-rnnt": frozenset({"asr.encoder", "asr.decoder", "asr.joiner"}),
-    "gigaam-multilingual-ctc": frozenset({"asr.model"}),
-    "gigaam-multilingual-large-ctc": frozenset({"asr.model"}),
     "nemo-fastconformer-ru-ctc": frozenset({"asr.model"}),
     "nemo-fastconformer-ru-rnnt": frozenset({"asr.encoder", "asr.decoder_joint"}),
     "nemo-parakeet-ctc-0.6b": frozenset({"asr.model"}),
@@ -117,7 +118,7 @@ def load_pipeline(settings: OnnxAsrSettings) -> Pipeline:
                 )
                 if vad_model.asr is not base_model.asr or vad_model.resampler is not base_model.resampler:
                     _raise_wrapper_identity_error()
-            _warmup_8khz(base_model)
+            _warmup_resampler(base_model, settings.model)
             audit = audit_cpu_sessions(base_model, vad_model, model_alias=settings.model)
         except OnnxAsrError:
             raise
@@ -130,15 +131,24 @@ def _raise_wrapper_identity_error() -> None:
     raise safe_error("model_load_failed")
 
 
-def _warmup_8khz(base_model: Any) -> None:  # noqa: ANN401 - upstream model protocol is intentionally generic
-    """Exercise the 8 kHz path before the definitive session audit."""
+def _resampler_rates(model_alias: str) -> tuple[int, ...]:
+    target_rate = TONE_SAMPLE_RATE if model_alias == "t-tech/t-one" else DEFAULT_SAMPLE_RATE
+    return tuple(rate for rate in KNOWN_SAMPLE_RATES if rate != target_rate)
+
+
+def _warmup_resampler(
+    base_model: Any,  # noqa: ANN401 - upstream model protocol is intentionally generic
+    model_alias: str,
+) -> None:
+    """Exercise a non-native input rate before the definitive session audit."""
+    sample_rate = DEFAULT_SAMPLE_RATE if model_alias == "t-tech/t-one" else TONE_SAMPLE_RATE
     with tempfile.TemporaryDirectory(prefix="hermes-onnx-asr-audit-") as directory:
-        sample = Path(directory) / "8khz.wav"
+        sample = Path(directory) / f"{sample_rate}hz.wav"
         with wave.open(str(sample), "wb") as audio:
             audio.setnchannels(1)
             audio.setsampwidth(2)
-            audio.setframerate(8_000)
-            audio.writeframes(b"\0\0" * 800)
+            audio.setframerate(sample_rate)
+            audio.writeframes(b"\0\0" * max(1, sample_rate // 10))
         base_model.recognize(sample, channel="mean")
 
 
@@ -196,7 +206,7 @@ def audit_cpu_sessions(  # noqa: C901 - explicit pinned onnx-asr session-role in
     model_roles = MODEL_SESSION_ROLES.get(model_alias)
     if model_roles is None:
         raise safe_error("cpu_provider_violation")
-    expected = set(model_roles) | {f"resampler.{rate}" for rate in RESAMPLER_RATES}
+    expected = set(model_roles) | {f"resampler.{rate}" for rate in _resampler_rates(model_alias)}
     if vad_model is not None:
         expected.add("vad.silero")
     if set(sessions) != expected:

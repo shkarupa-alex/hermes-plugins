@@ -7,9 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from hermes_onnx_asr.catalog import certified_model_names
 from hermes_onnx_asr.config import OnnxAsrSettings, RuntimeSettings
 from hermes_onnx_asr.errors import OnnxAsrError, safe_error
 from hermes_onnx_asr.provider import OnnxAsrProvider, _Job, _Scheduler, failure_result
+
+
+def test_provider_advertises_only_release_smoked_models() -> None:
+    advertised = tuple(item["id"] for item in OnnxAsrProvider().list_models())
+    assert advertised == certified_model_names()
 
 
 def test_failure_envelope_is_stable_and_path_free() -> None:
