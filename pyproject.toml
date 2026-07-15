@@ -7,7 +7,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-    "jiwer==3.1.0",
+    "jiwer==4.0.0",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "pyright>=1.1.400",
