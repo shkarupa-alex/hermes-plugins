@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 htmlcov/
+release-corpus/result.json
 .env
 .env.*
 !.env.example

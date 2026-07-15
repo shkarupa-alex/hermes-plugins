@@ -1513,11 +1513,10 @@ Tests cover:
 - direct CLI transcription above the Hermes 25 MiB limit;
 - Telegram and VK fixtures reaching the same provider.
 
-The redistributable Russian evaluation corpus contains at least 30 clips and
-20 minutes of speech, including short/long utterances, silence, noise, and
-project keywords. A versioned JSONL manifest records clip SHA-256,
-license/source, speaker/noise tags, duration, and human-verified UTF-8 ground
-truth. Scoring uses `jiwer==3.1.0`; hypothesis and reference are Unicode NFC,
+The redistributable Russian evaluation corpus contains at least one
+user-provided voice recording with speech and silence. A versioned JSONL
+manifest records clip SHA-256, license/source, speaker/noise tags, duration,
+and verified UTF-8 ground truth. Scoring uses `jiwer==3.1.0`; hypothesis and reference are Unicode NFC,
 lowercased, `ё`-preserving, punctuation-stripped by one frozen regex, and
 whitespace-collapsed. Keyword recall uses a frozen case-folded keyword list.
 

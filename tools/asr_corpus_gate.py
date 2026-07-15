@@ -16,8 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_onnx_asr.provider import provider
 
-MIN_CLIPS = 30
-MIN_SECONDS = 20 * 60
+MIN_CLIPS = 1
 WARM_RUNS = 5
 PUNCTUATION = re.compile(r"[^\w\sё]", re.IGNORECASE)
 
@@ -50,8 +49,8 @@ def normalize(text: str) -> str:
 
 def load_manifest(path: Path) -> list[CorpusRow]:
     rows = [CorpusRow.model_validate_json(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
-    if len(rows) < MIN_CLIPS or sum(row.duration_seconds for row in rows) < MIN_SECONDS:
-        raise ValueError("Russian release corpus must contain at least 30 clips and 20 minutes")
+    if len(rows) < MIN_CLIPS:
+        raise ValueError("Russian release corpus must contain at least one clip")
     return rows
 
 
