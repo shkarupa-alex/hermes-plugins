@@ -2,6 +2,6 @@ name: onnx-asr
 manifest_version: 1
 label: ONNX ASR
 kind: backend
-version: 1.0.12
+version: 1.0.14
 description: Offline CPU-only speech recognition for Hermes Agent using onnx-asr.
 author: Hermes ONNX ASR contributors
