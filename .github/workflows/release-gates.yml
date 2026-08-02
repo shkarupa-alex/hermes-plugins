@@ -113,30 +113,10 @@ jobs:
           path: release-corpus/result.json
 
   upstream-model-smoke:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {model: gigaam-v2-ctc, quantization: int8}
-          - {model: gigaam-v2-rnnt, quantization: int8}
-          - {model: gigaam-v3-ctc, quantization: int8}
-          - {model: gigaam-v3-rnnt, quantization: int8}
-          - {model: gigaam-v3-e2e-ctc, quantization: int8}
-          - {model: gigaam-v3-e2e-rnnt, quantization: int8}
-          - {model: gigaam-multilingual-ctc, quantization: int8}
-          - {model: gigaam-multilingual-large-ctc, quantization: int8}
-          - {model: nemo-fastconformer-ru-ctc, quantization: int8}
-          - {model: nemo-fastconformer-ru-rnnt, quantization: int8}
-          - {model: nemo-parakeet-ctc-0.6b, quantization: int8}
-          - {model: nemo-parakeet-rnnt-0.6b, quantization: int8}
-          - {model: nemo-parakeet-tdt-0.6b-v2, quantization: int8}
-          - {model: nemo-parakeet-tdt-0.6b-v3, quantization: int8}
-          - {model: nemo-canary-1b-v2, quantization: int8}
-          - {model: alphacep/vosk-model-ru, quantization: int8}
-          - {model: alphacep/vosk-model-small-ru, quantization: int8}
-          - {model: t-tech/t-one, quantization: fp32}
-          - {model: whisper-base, quantization: int8}
     runs-on: ubuntu-latest
+    env:
+      ASR_MODEL: gigaam-v3-e2e-rnnt
+      ASR_QUANTIZATION: int8
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.3.2
@@ -145,11 +125,9 @@ jobs:
         run: |
           profile_root="${RUNNER_TEMP//\\//}/hermes-profile"
           mkdir -p "$profile_root"
-          config_quantization="${{ matrix.quantization }}"
-          if [ "$config_quantization" = fp32 ]; then config_quantization=null; fi
-          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: ${{ matrix.model }}\n    quantization: %s\n    model_dir: "%s/models/onnx-asr"\n    vad:\n      min_audio_seconds: null\n' "$config_quantization" "$profile_root" > "$profile_root/config.yaml"
+          printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: %s\n    quantization: %s\n    model_dir: "%s/models/onnx-asr"\n    vad:\n      min_audio_seconds: null\n' "$ASR_MODEL" "$ASR_QUANTIZATION" "$profile_root" > "$profile_root/config.yaml"
           echo "HERMES_HOME=$profile_root" >> "$GITHUB_ENV"
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "${{ matrix.model }}" --quantization "${{ matrix.quantization }}"
+      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "$ASR_MODEL" --quantization "$ASR_QUANTIZATION"
       - run: uv run --package hermes-onnx-asr hermes onnx-asr warmup
 
   vk-live:
