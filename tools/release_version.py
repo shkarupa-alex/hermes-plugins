@@ -212,9 +212,7 @@ def _validate_dist_entries(dist_dir: Path, expected: set[str]) -> None:
     if len(bookkeeping) > 1 or any(not path.is_file() or path.is_symlink() for path in bookkeeping):
         invalid_entries.append(".gitignore")
     if actual != expected or invalid_entries:
-        raise ReleaseVersionError(
-            f"artifact set differs: missing={sorted(expected - actual)}, extra={invalid_entries}"
-        )
+        raise ReleaseVersionError(f"artifact set differs: missing={sorted(expected - actual)}, extra={invalid_entries}")
 
 
 def verify_artifacts(root: Path, release: ReleaseVersion, dist_dir: Path) -> tuple[Path, ...]:
