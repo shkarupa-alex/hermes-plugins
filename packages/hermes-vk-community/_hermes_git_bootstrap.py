@@ -89,7 +89,10 @@ def _install_command(requirements: tuple[str, ...]) -> list[str]:
 
 @contextmanager
 def _installation_lock() -> Generator[None, None, None]:
-    lock = Path(sys.executable).resolve().parent.parent / ".hermes-plugin-deps.lock"
+    # ``sys.executable`` is commonly a venv symlink to a system interpreter.
+    # Resolving it escapes the venv and can point at an unwritable path such as
+    # ``/usr``. ``sys.prefix`` is the environment whose dependencies we mutate.
+    lock = Path(sys.prefix) / ".hermes-plugin-deps.lock"
     deadline = time.monotonic() + INSTALL_TIMEOUT_SECONDS
     while True:
         try:

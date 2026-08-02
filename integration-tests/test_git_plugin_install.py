@@ -101,3 +101,22 @@ def test_git_subdirectory_respects_lazy_install_opt_out(
     monkeypatch.setattr(bootstrap, "_install_command", install_command)
     with pytest.raises(RuntimeError, match="lazy installs are disabled; run: uv pip install"):
         bootstrap._ensure_dependencies(ROOT / "packages" / directory_name)
+
+
+@pytest.mark.parametrize(("directory_name", "_package_name"), PLUGIN_CASES)
+def test_git_subdirectory_locks_the_active_environment(
+    directory_name: str,
+    _package_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_directory_plugin(directory_name)
+    bootstrap = sys.modules[f"{module.__name__}._hermes_git_bootstrap"]
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    monkeypatch.setattr(bootstrap.sys, "prefix", str(environment))
+
+    with bootstrap._installation_lock():
+        assert (environment / ".hermes-plugin-deps.lock").is_dir()
+
+    assert not (environment / ".hermes-plugin-deps.lock").exists()
