@@ -22,7 +22,8 @@ jobs:
       - name: Audit locked production dependencies
         run: |
           uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
-          # hermes-agent 0.18.2 pins these exact vulnerable versions. Keep the
+          # hermes-agent 0.18.2 pins these exact vulnerable versions and is
+          # itself associated with two upstream-only advisories. Keep the
           # exceptions narrow and remove them as soon as upstream publishes a
           # compatible release with cryptography>=48.0.1 and Pillow>=12.3.0.
           uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip \
@@ -34,7 +35,14 @@ jobs:
             --ignore-vuln PYSEC-2026-2257 \
             --ignore-vuln PYSEC-2026-3451 \
             --ignore-vuln PYSEC-2026-3452 \
-            --ignore-vuln PYSEC-2026-3453
+            --ignore-vuln PYSEC-2026-3453 \
+            --ignore-vuln PYSEC-2026-3454 \
+            --ignore-vuln PYSEC-2026-3493 \
+            --ignore-vuln PYSEC-2026-3494 \
+            --ignore-vuln PYSEC-2026-3495 \
+            --ignore-vuln PYSEC-2026-3496 \
+            --ignore-vuln CVE-2026-10221 \
+            --ignore-vuln CVE-2026-10224
       - name: Scan repository history for secrets
         uses: gitleaks/gitleaks-action@v3
         env:
@@ -90,7 +98,7 @@ jobs:
       - if: matrix.hermes == '0.18.2'
         run: uv pip install "hermes-agent==${{ matrix.hermes }}"
       - if: matrix.hermes == 'latest-supported'
-        run: uv pip install --upgrade "hermes-agent>=0.18.2,<0.19"
+        run: uv pip install --upgrade "hermes-agent>=0.18.2"
       - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
 
   hermes-main-warning:
@@ -100,5 +108,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v8.3.2
       - run: uv sync --all-packages --locked
-      - run: uv pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main"
+      - name: Install Hermes main as an editable checkout
+        run: |
+          git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent-main"
+          uv pip install --editable "$RUNNER_TEMP/hermes-agent-main"
       - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
