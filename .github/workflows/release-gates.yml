@@ -7,6 +7,10 @@ on:
         description: Release tag whose version must match plugin metadata
         required: false
         type: string
+      release_ref:
+        description: Fully qualified Git ref to test for a release
+        required: false
+        type: string
   workflow_dispatch:
 
 jobs:
@@ -18,12 +22,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v8.3.2
       - name: Verify plugin release metadata
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           if [ -n "$RELEASE_TAG" ]; then
+            python tools/release_version.py apply "$RELEASE_TAG"
             python tools/check_versions.py --tag "$RELEASE_TAG"
           else
             python tools/check_versions.py
@@ -65,6 +71,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v8.3.2
         with:
           enable-cache: true
@@ -89,6 +97,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v8.3.2
       - run: uv sync --all-packages --locked
       - name: Install ffmpeg
@@ -119,6 +129,8 @@ jobs:
       ASR_QUANTIZATION: int8
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v8.3.2
       - run: uv sync --all-packages --locked
       - name: Configure model profile
@@ -138,6 +150,8 @@ jobs:
       VK_TEST_PEER_ID: ${{ secrets.VK_TEST_PEER_ID }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v8.3.2
       - run: uv sync --all-packages --locked
       - name: Require private VK release-test credentials

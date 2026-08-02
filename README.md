@@ -35,3 +35,22 @@ hermes gateway restart
 
 Подробности: [ONNX ASR](packages/hermes-onnx-asr/README.md) и
 [VK Community](packages/hermes-vk-community/README.md).
+
+## Выпуск в PyPI
+
+Версия релиза определяется Git-тегом. Перед сборкой CI временно подставляет её
+в `plugin.yaml` каждого пакета, собирает wheel и sdist и проверяет версию как в
+Python metadata, так и во вложенном `plugin.yaml`. Обновлять версии манифестов
+вручную перед релизом не требуется.
+
+Для SourceTree GitFlow настройте пустой префикс version tag один раз:
+
+```bash
+git config gitflow.prefix.versiontag ""
+```
+
+После этого вводите в поле версии SourceTree полное значение `v1.2.3`: GitFlow
+создаст ровно такой тег, без дополнительной `v`. Тег запустит публикацию, а CI
+получит из него версию пакетов `1.2.3`. Ручной запуск workflow принимает как
+`1.2.3`, так и `v1.2.3` и в обоих случаях ищет существующий тег `v1.2.3`.
+Значения вида `vv1.2.3`, prerelease-версии и версии с пробелами отклоняются.
