@@ -5,6 +5,26 @@ import pytest
 from hermes_onnx_asr import compat
 
 
+def test_compatibility_accepts_newer_hermes_when_contract_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    def installed(package: str) -> str:
+        return "99.0.0" if package == "hermes-agent" else "0.0.0"
+
+    monkeypatch.setattr(compat, "version", installed)
+    compatible, message = compat.check_compatibility()
+    assert compatible
+    assert message == "Hermes Agent 99.0.0 transcription contract is compatible"
+
+
+def test_compatibility_rejects_hermes_below_minimum(monkeypatch: pytest.MonkeyPatch) -> None:
+    def installed(_package: str) -> str:
+        return "0.18.1"
+
+    monkeypatch.setattr(compat, "version", installed)
+    compatible, message = compat.check_compatibility()
+    assert not compatible
+    assert message == "Hermes Agent 0.18.1 is below the minimum supported version >=0.18.2"
+
+
 def test_requirement_check_accepts_certified_version_window(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compat, "check_compatibility", lambda: (True, "ok"))
 

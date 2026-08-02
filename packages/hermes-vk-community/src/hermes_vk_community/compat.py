@@ -7,7 +7,6 @@ from hermes_cli.plugins import PluginContext
 from packaging.version import Version
 
 MIN_HERMES = Version("0.18.2")
-MAX_HERMES = Version("0.19")
 
 
 def _shape(function: object) -> tuple[tuple[str, int, bool], ...]:
@@ -22,8 +21,8 @@ def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract 
         installed = Version(version("hermes-agent"))
     except PackageNotFoundError:
         return False, "hermes-agent is not installed"
-    if not MIN_HERMES <= installed < MAX_HERMES:
-        return False, f"hermes-agent {installed} is outside the tested range >=0.18.2,<0.19"
+    if installed < MIN_HERMES:
+        return False, f"hermes-agent {installed} is below the minimum supported version >=0.18.2"
     expected = {
         "connect": (("self", 1, False), ("is_reconnect", 3, True)),
         "send": (
