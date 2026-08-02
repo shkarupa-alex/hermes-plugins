@@ -7,7 +7,6 @@ from hermes_cli.plugins import PluginContext
 from packaging.version import Version
 
 MIN_HERMES = Version("0.18.2")
-MAX_HERMES = Version("0.19")
 MIN_ONNX_ASR = Version("0.12.0")
 MAX_ONNX_ASR = Version("0.13")
 MIN_ONNXRUNTIME = Version("1.23.2")
@@ -28,8 +27,8 @@ def check_compatibility() -> tuple[bool, str]:
         installed = Version(version("hermes-agent"))
     except (ImportError, PackageNotFoundError) as exc:
         return False, f"Hermes Agent is unavailable: {exc}"
-    if not MIN_HERMES <= installed < MAX_HERMES:
-        return False, f"Hermes Agent {installed} is outside the tested range >=0.18.2,<0.19"
+    if installed < MIN_HERMES:
+        return False, f"Hermes Agent {installed} is below the minimum supported version >=0.18.2"
     parameters = inspect.signature(TranscriptionProvider.transcribe).parameters
     shape = tuple(
         (parameter.name, parameter.kind, parameter.default is not inspect.Parameter.empty)
