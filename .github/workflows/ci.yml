@@ -92,7 +92,7 @@ jobs:
   hermes-compatibility:
     strategy:
       matrix:
-        hermes: ["0.18.2", "latest-supported"]
+        hermes: ["0.18.2", "latest-supported", "0.20.6"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -102,7 +102,20 @@ jobs:
         run: uv pip install "hermes-agent==${{ matrix.hermes }}"
       - if: matrix.hermes == 'latest-supported'
         run: uv pip install --upgrade "hermes-agent>=0.18.2"
-      - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
+      - if: matrix.hermes == '0.20.6'
+        name: Install frozen Hermes 0.20.6 release
+        run: |
+          git clone --filter=blob:none --no-checkout --depth 1 --branch v2026.8.27 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent-0.20.6"
+          git -C "$RUNNER_TEMP/hermes-agent-0.20.6" sparse-checkout set agent tools gateway
+          git -C "$RUNNER_TEMP/hermes-agent-0.20.6" checkout
+          uv pip install --editable "$RUNNER_TEMP/hermes-agent-0.20.6"
+      - run: >-
+          uv run --no-sync pytest -q
+          packages/hermes-vk-community/tests/test_compat.py
+          packages/hermes-vk-community/tests/test_plugin.py
+          packages/hermes-onnx-asr/tests/test_compat.py
+          packages/hermes-onnx-asr/tests/test_plugin.py
+          integration-tests
 
   hermes-main-warning:
     continue-on-error: true
@@ -115,4 +128,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent-main"
           uv pip install --editable "$RUNNER_TEMP/hermes-agent-main"
-      - run: uv run --no-sync pytest -q packages/hermes-vk-community/tests/test_plugin.py packages/hermes-onnx-asr/tests/test_plugin.py integration-tests
+      - run: >-
+          uv run --no-sync pytest -q
+          packages/hermes-vk-community/tests/test_compat.py
+          packages/hermes-vk-community/tests/test_plugin.py
+          packages/hermes-onnx-asr/tests/test_compat.py
+          packages/hermes-onnx-asr/tests/test_plugin.py
+          integration-tests
