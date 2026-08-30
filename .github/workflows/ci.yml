@@ -106,7 +106,7 @@ jobs:
         name: Install frozen Hermes 0.20.6 release
         run: |
           git clone --filter=blob:none --no-checkout --depth 1 --branch v2026.8.27 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent-0.20.6"
-          git -C "$RUNNER_TEMP/hermes-agent-0.20.6" sparse-checkout set agent tools gateway
+          git -C "$RUNNER_TEMP/hermes-agent-0.20.6" sparse-checkout set agent tools hermes_cli gateway tui_gateway cron acp_adapter plugins providers
           git -C "$RUNNER_TEMP/hermes-agent-0.20.6" checkout
           uv pip install --editable "$RUNNER_TEMP/hermes-agent-0.20.6"
       - run: >-
