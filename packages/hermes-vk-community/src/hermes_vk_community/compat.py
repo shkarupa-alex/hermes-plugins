@@ -23,6 +23,15 @@ def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract 
         return False, "hermes-agent is not installed"
     if installed < MIN_HERMES:
         return False, f"hermes-agent {installed} is below the minimum supported version >=0.18.2"
+    supports_draft_streaming_legacy = (
+        ("self", 1, False),
+        ("chat_type", 1, True),
+        ("metadata", 1, True),
+    )
+    supports_draft_streaming_current = (
+        *supports_draft_streaming_legacy,
+        ("chat_id", 1, True),
+    )
     expected = {
         "connect": (("self", 1, False), ("is_reconnect", 3, True)),
         "send": (
@@ -95,11 +104,7 @@ def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract 
             ("metadata", 1, True),
             ("kwargs", 4, False),
         ),
-        "supports_draft_streaming": (
-            ("self", 1, False),
-            ("chat_type", 1, True),
-            ("metadata", 1, True),
-        ),
+        "supports_draft_streaming": supports_draft_streaming_current,
         "prefers_fresh_final_streaming": (
             ("self", 1, False),
             ("content", 1, False),
@@ -110,7 +115,12 @@ def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract 
 
     for name, expected_shape in expected.items():
         method = getattr(BasePlatformAdapter, name, None)
-        if method is None or _shape(method) != expected_shape:
+        base_shapes = (
+            (supports_draft_streaming_legacy, supports_draft_streaming_current)
+            if name == "supports_draft_streaming"
+            else (expected_shape,)
+        )
+        if method is None or _shape(method) not in base_shapes:
             return False, f"BasePlatformAdapter.{name} signature changed: {_shape(method) if method else 'missing'}"
         adapter_method = getattr(VkCommunityAdapter, name, None)
         if adapter_method is None or _shape(adapter_method) != expected_shape:
