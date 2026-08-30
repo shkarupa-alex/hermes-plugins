@@ -581,6 +581,7 @@ async def test_final_edit_with_table_sends_ordered_fresh_final_and_removes_previ
     adapter._client = cast("VkApiClient", client)
     content = "До.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nПосле."  # noqa: RUF001
     try:
+        assert not adapter.supports_draft_streaming(chat_type="private", metadata={}, chat_id="456")
         assert adapter.prefers_fresh_final_streaming(content)
         result = await adapter.edit_message("456", "99", content, finalize=True)
         assert result.success

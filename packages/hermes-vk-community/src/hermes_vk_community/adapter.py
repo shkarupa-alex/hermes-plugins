@@ -601,8 +601,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
             retryable=False,
         )
 
-    def supports_draft_streaming(self, chat_type: str | None = None, metadata: dict[str, Any] | None = None) -> bool:
-        del chat_type, metadata
+    def supports_draft_streaming(
+        self,
+        chat_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        chat_id: str | None = None,
+    ) -> bool:
+        del chat_type, metadata, chat_id
         return False
 
     def prefers_fresh_final_streaming(self, content: str, metadata: dict[str, Any] | None = None) -> bool:
