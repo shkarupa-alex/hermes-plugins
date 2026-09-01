@@ -32,7 +32,7 @@ from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
 from hermes_vk_community.capabilities import rich_capability_ready
 from hermes_vk_community.client import VkApiClient
 from hermes_vk_community.config import PolicyEnvironment, VkSettings, settings_from_platform_config
-from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import (
     DocumentUploadResponse,
     Group,
@@ -1448,7 +1448,16 @@ def _is_retryable_poll_error(exc: BaseException) -> bool:
         return exc.code in {6, 10}
     if isinstance(exc, VkHttpError):
         return exc.status == HTTP_TOO_MANY_REQUESTS or exc.status >= HTTP_SERVER_ERROR_MIN
-    return isinstance(exc, (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ServerDisconnectedError, OSError))
+    return isinstance(
+        exc,
+        (
+            TimeoutError,
+            VkLongPollProtocolError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ServerDisconnectedError,
+            OSError,
+        ),
+    )
 
 
 def _log_poll_retry(state: RetryCallState) -> None:

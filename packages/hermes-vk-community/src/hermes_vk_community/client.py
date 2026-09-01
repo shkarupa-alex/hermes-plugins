@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import urljoin
 
 import aiohttp
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from hermes_vk_community.config import API_VERSION, MediaSettings
-from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import LongPollLease, LongPollResponse, VkApiEnvelope
 from hermes_vk_community.security import LONG_POLL_SUFFIXES, MEDIA_SUFFIXES, VkPinnedResolver, validate_https_url
 
@@ -31,6 +31,20 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 MAX_MEDIA_REDIRECTS = 3
 HTTP_REDIRECT_MIN = 300
 HTTP_ERROR_MIN = 400
+
+
+def _parse_long_poll_lease(payload: object) -> LongPollLease:
+    try:
+        return LongPollLease.model_validate(payload)
+    except ValidationError as exc:
+        raise VkLongPollProtocolError("VK Long Poll lease response has an invalid schema") from exc
+
+
+def _parse_long_poll_response(payload: object) -> LongPollResponse:
+    try:
+        return LongPollResponse.model_validate(payload)
+    except ValidationError as exc:
+        raise VkLongPollProtocolError("VK Long Poll response has an invalid schema") from exc
 
 
 def _connector(resolver: AbstractResolver) -> aiohttp.TCPConnector:
@@ -98,8 +112,11 @@ class VkApiClient:
         return envelope.response
 
     async def get_long_poll_lease(self, group_id: int) -> LongPollLease:
-        payload = await self.call("groups.getLongPollServer", {"group_id": group_id})
-        return LongPollLease.model_validate(payload)
+        try:
+            payload = await self.call("groups.getLongPollServer", {"group_id": group_id})
+        except ValidationError as exc:
+            raise VkLongPollProtocolError("VK Long Poll lease response has an invalid schema") from exc
+        return _parse_long_poll_lease(payload)
 
     async def poll(self, lease: LongPollLease, *, ts: str, wait_seconds: int) -> LongPollResponse:
         validate_https_url(lease.server, suffixes=LONG_POLL_SUFFIXES)
@@ -122,7 +139,11 @@ class VkApiClient:
                 if response.status >= HTTP_ERROR_MIN:
                     # Never construct ClientResponseError: its URL contains the Long Poll key.
                     raise VkHttpError(response.status, "Long Poll")
-                return LongPollResponse.model_validate(await response.json(content_type=None))
+                try:
+                    payload = await response.json(content_type=None)
+                except ValueError as exc:
+                    raise VkLongPollProtocolError("VK Long Poll response has an invalid schema") from exc
+                return _parse_long_poll_response(payload)
         finally:
             await resolver.close()
 

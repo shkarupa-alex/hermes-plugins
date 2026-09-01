@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Generic, Literal, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 T = TypeVar("T")
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -27,11 +27,30 @@ class LongPollLease(VkModel):
     server: str
     ts: str
 
+    @field_validator("ts", mode="before")
+    @classmethod
+    def normalize_numeric_ts(cls, value: object) -> object:
+        return _normalize_long_poll_ts(value)
+
 
 class LongPollResponse(VkModel):
     ts: str | None = None
     updates: list[JsonObject] = Field(default_factory=list[JsonObject])
     failed: int | None = None
+
+    @field_validator("ts", mode="before")
+    @classmethod
+    def normalize_numeric_ts(cls, value: object) -> object:
+        return _normalize_long_poll_ts(value)
+
+
+def _normalize_long_poll_ts(value: object) -> object:
+    # VK usually returns this opaque cursor as a decimal string, but the Long
+    # Poll endpoint also emits a JSON number after some server/lease resets.
+    # bool is deliberately excluded even though it is an int subclass.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return value
 
 
 class CommunityLongPollEvents(VkModel):

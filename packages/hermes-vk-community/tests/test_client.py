@@ -7,11 +7,17 @@ from typing import TYPE_CHECKING, Self, cast
 
 import pytest
 
-from hermes_vk_community.client import DownloadedMedia, VkApiClient, _stream_limited_to_temp
-from hermes_vk_community.errors import VkSecurityError
+from hermes_vk_community.client import (
+    DownloadedMedia,
+    VkApiClient,
+    _parse_long_poll_lease,
+    _parse_long_poll_response,
+    _stream_limited_to_temp,
+)
+from hermes_vk_community.errors import VkLongPollProtocolError, VkSecurityError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     import aiohttp
 
@@ -23,6 +29,28 @@ class _Content:
     async def iter_chunked(self, _size: int) -> AsyncIterator[bytes]:
         for chunk in self._chunks:
             yield chunk
+
+
+def test_long_poll_payload_parsers_normalize_numeric_cursor() -> None:
+    lease = _parse_long_poll_lease({"key": "key", "server": "https://lp.vk.com", "ts": 81})
+    response = _parse_long_poll_response({"ts": 82, "updates": []})
+    assert lease.ts == "81"
+    assert response.ts == "82"
+
+
+@pytest.mark.parametrize(
+    ("parser", "payload"),
+    [
+        (_parse_long_poll_lease, {"key": "key", "server": "https://lp.vk.com"}),
+        (_parse_long_poll_response, {"ts": True, "updates": []}),
+    ],
+)
+def test_long_poll_payload_parsers_raise_retryable_protocol_error(
+    parser: Callable[[object], object],
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(VkLongPollProtocolError):
+        parser(payload)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,10 @@ class VkDeliveryUnknownError(TimeoutError):
     pass
 
 
+class VkLongPollProtocolError(Exception):
+    """A malformed VK Long Poll response that may recover on the next request."""
+
+
 @dataclass(slots=True)
 class VkHttpError(Exception):
     status: int
