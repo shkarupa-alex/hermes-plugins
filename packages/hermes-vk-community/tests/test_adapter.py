@@ -19,7 +19,7 @@ from hermes_vk_community.adapter import (
     _is_retryable_send_error,
     _source_prefix_for_rendered,
 )
-from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkLongPollProtocolError
 from hermes_vk_community.models import InteractionPayload, LongPollLease, LongPollResponse, VkAttachment, VkMessage
 from hermes_vk_community.plugin import build_adapter
 from hermes_vk_community.renderer import RenderedTableSegment, RenderedTextSegment, RichVkRenderer
@@ -137,10 +137,39 @@ def test_retries_only_definitely_rejected_send_attempts() -> None:
     assert not _is_retryable_send_error(VkDeliveryUnknownError("timed out"))
 
 
-def test_poll_retries_transport_errors_but_not_protocol_errors() -> None:
+def test_poll_retries_transport_and_remote_protocol_errors() -> None:
     assert _is_retryable_poll_error(TimeoutError())
     assert _is_retryable_poll_error(OSError())
+    assert _is_retryable_poll_error(VkLongPollProtocolError("malformed response"))
     assert not _is_retryable_poll_error(ValueError("invalid lease host"))
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_recovers_from_malformed_remote_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _adapter()
+    adapter.settings.long_poll.retry_min_seconds = 0.001
+    adapter.settings.long_poll.retry_max_seconds = 0.001
+    adapter._running = True
+    attempts = 0
+    fatal_errors: list[str] = []
+
+    async def poll_once() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise VkLongPollProtocolError("malformed response")
+        adapter._running = False
+
+    def record_fatal(error_code: str, *_args: object, **_kwargs: object) -> None:
+        fatal_errors.append(error_code)
+
+    monkeypatch.setattr(adapter, "_poll_once", poll_once)
+    monkeypatch.setattr(adapter, "_set_fatal_error", record_fatal)
+
+    await adapter._poll_loop()
+
+    assert attempts == 2
+    assert fatal_errors == []
 
 
 @pytest.mark.asyncio
