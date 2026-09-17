@@ -17,7 +17,7 @@ dependencies = [
     "hermes-agent>=0.18.2",
     "markdown-it-py>=4.0.0,<5",
     "packaging>=24,<27",
-    "pillow==12.2.0",
+    "pillow>=12.2,<13",
     "pydantic>=2.10.0,<3",
     "pydantic-settings>=2.7.0,<3",
     "tenacity==9.1.4",

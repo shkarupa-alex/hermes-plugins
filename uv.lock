@@ -721,7 +721,7 @@ requires-dist = [
     { name = "hermes-agent", specifier = ">=0.18.2" },
     { name = "markdown-it-py", specifier = ">=4.0.0,<5" },
     { name = "packaging", specifier = ">=24,<27" },
-    { name = "pillow", specifier = "==12.2.0" },
+    { name = "pillow", specifier = ">=12.2,<13" },
     { name = "pydantic", specifier = ">=2.10.0,<3" },
     { name = "pydantic-settings", specifier = ">=2.7.0,<3" },
     { name = "tenacity", specifier = "==9.1.4" },
