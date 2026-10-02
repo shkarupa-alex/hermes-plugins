@@ -67,6 +67,8 @@ from tools import slash_confirm
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from hermes_vk_community.storage import OutboxRecord
+
 logger = logging.getLogger(__name__)
 HTTP_TOO_MANY_REQUESTS = 429
 HTTP_SERVER_ERROR_MIN = 500
@@ -392,33 +394,17 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     )
                 return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
             except VkApiError as exc:
-                if exc.code == VK_TOO_LONG_ERROR and self._effective_limit > MIN_MESSAGE_LIMIT:
-                    await self._storage.mark_outbox(record.id, "failed", error="VK rejected chunk at cached limit")
-                    self._effective_limit = max(MIN_MESSAGE_LIMIT, min(self._effective_limit - 1, len(chunk) // 2))
-                    replacement_spans = split_message_with_spans(chunk, self._effective_limit)
-                    replacement_chunks = [item.text for item in replacement_spans]
-                    replacement_formats = [format_data_for_chunk(chunk_format, item) for item in replacement_spans]
-                    replacement = await self._storage.prepare_outbox(
-                        peer_id,
-                        replacement_chunks,
-                        reply_to,
-                        format_data=replacement_formats,
-                    )
+                if exc.code == VK_TOO_LONG_ERROR and len(chunk) > MIN_MESSAGE_LIMIT:
+                    replacement = await self._rechunk_rejected(record)
                     pending[index : index + 1] = [
                         (
-                            replacement_chunk,
-                            replacement_format,
+                            replacement_record.wire_content,
+                            replacement_record.format_data,
                             replacement_record,
-                            chunk_start + replacement_span.start,
-                            chunk_start + replacement_span.end,
+                            chunk_start + start,
+                            chunk_start + end,
                         )
-                        for replacement_chunk, replacement_format, replacement_record, replacement_span in zip(
-                            replacement_chunks,
-                            replacement_formats,
-                            replacement,
-                            replacement_spans,
-                            strict=True,
-                        )
+                        for replacement_record, start, end in replacement
                     ]
                     continue
                 state = "partial_delivery" if delivered else "failed"
@@ -544,13 +530,30 @@ class VkCommunityAdapter(BasePlatformAdapter):
             await self._storage.mark_outbox(record.id, "delivery_unknown", error=type(exc).__name__)
             return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
 
+    async def _rechunk_rejected(self, record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
+        if self._storage is None:
+            raise RuntimeError("VK storage is not connected")
+        self._effective_limit = max(MIN_MESSAGE_LIMIT, min(self._effective_limit, len(record.wire_content) // 2))
+        spans = split_message_with_spans(record.wire_content, self._effective_limit)
+        replacement = await self._storage.prepare_outbox(
+            record.peer_id,
+            [span.text for span in spans],
+            record.reply_target,
+            format_data=[format_data_for_chunk(record.format_data, span) for span in spans],
+            replace_rejected=record,
+        )
+        return [(item, span.start, span.end) for item, span in zip(replacement, spans, strict=True)]
+
     async def _recover_prepared_outbox(self) -> None:
         if self._client is None or self._storage is None:
             return
         records = await self._storage.prepared_outbox()
         blocked_invocations: set[str] = set()
-        for record_index, record in enumerate(records):
+        record_index = 0
+        while record_index < len(records):
+            record = records[record_index]
             if record.invocation_id in blocked_invocations:
+                record_index += 1
                 continue
             try:
                 await self._storage.mark_outbox(record.id, "sending")
@@ -585,6 +588,14 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 )
                 blocked_invocations.add(record.invocation_id)
             except Exception as exc:  # noqa: BLE001 - recovery records terminal diagnostics
+                if (
+                    isinstance(exc, VkApiError)
+                    and exc.code == VK_TOO_LONG_ERROR
+                    and len(record.wire_content) > MIN_MESSAGE_LIMIT
+                ):
+                    replacement = await self._rechunk_rejected(record)
+                    records[record_index : record_index + 1] = [item for item, _start, _end in replacement]
+                    continue
                 await self._storage.terminalize_outbox_failure(
                     record,
                     "failed",
@@ -593,6 +604,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     "blocked after failed recovery chunk",
                 )
                 blocked_invocations.add(record.invocation_id)
+            record_index += 1
 
     async def edit_message(  # noqa: C901, PLR0911 - edit delivery has distinct partial/ambiguous outcomes
         self,

@@ -338,6 +338,96 @@ async def test_error_914_progressively_reduces_and_caches_limit(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed_replacements", [0, 1, 2])
+async def test_rechunked_invocation_recovers_in_order_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confirmed_replacements: int
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    path = tmp_path / "state.sqlite3"
+    storage = VkStorage(path)
+    await storage.open()
+    delivered: list[str] = []
+    requests = 0
+
+    class ProcessCrash(BaseException):
+        pass
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        nonlocal requests
+        requests += 1
+        if len(str(params["message"])) > 256:
+            raise VkApiError(914, "message too long")
+        delivered.append(str(params["message"]))
+        return requests
+
+    original_mark = storage.mark_outbox
+
+    async def crash_before_dispatch(
+        row_id: int, state: str, *, message_id: str | None = None, error: str | None = None
+    ) -> None:
+        if state == "sending" and requests > 0 and len(delivered) == confirmed_replacements:
+            raise ProcessCrash
+        await original_mark(row_id, state, message_id=message_id, error=error)
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr(storage, "mark_outbox", crash_before_dispatch)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    content = "a" * 512 + "b" * 512 + "c" * 76
+    try:
+        with pytest.raises(ProcessCrash):
+            await adapter.send("456", content)
+    finally:
+        await storage.close()
+
+    reopened = VkStorage(path)
+    await reopened.open()
+    adapter._storage = reopened
+    try:
+        pending = await reopened.prepared_outbox()
+        assert [len(row.wire_content) for row in pending] == [256, 256, 512, 76][confirmed_replacements:]
+        assert len({row.invocation_id for row in pending}) == 1
+        await adapter._recover_prepared_outbox()
+        assert "".join(delivered) == content
+        assert await reopened.prepared_outbox() == []
+        assert len(await reopened.diagnostic_rows(outbox_state="sent")) == 5
+        assert len(await reopened.diagnostic_rows(outbox_state="failed")) == 2
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_rechunking_preserves_one_logical_invocation(tmp_path: Path) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    delivered: list[str] = []
+
+    class LengthClient:
+        async def call(self, _method: str, params: dict[str, object]) -> int:
+            text = str(params["message"])
+            if len(text) > 256:
+                raise VkApiError(914, "message too long")
+            delivered.append(text)
+            return len(delivered)
+
+    adapter._storage = storage
+    adapter._client = cast("VkApiClient", LengthClient())
+    content = "a" * 512 + "b" * 512 + "c" * 76
+    try:
+        result = await adapter.send("456", content)
+        assert result.success
+        assert "".join(delivered) == content
+        rows = await storage.diagnostic_rows(outbox_state="sent")
+        assert len({row["invocation_id"] for row in rows}) == 1
+        assert sorted(int(cast("int", row["chunk_index"])) for row in rows) == list(range(5))
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_chunk_makes_unsent_tail_terminal(tmp_path: Path) -> None:
     adapter = _adapter()
     storage = VkStorage(tmp_path / "state.sqlite3")

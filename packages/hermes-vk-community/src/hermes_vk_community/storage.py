@@ -315,7 +315,7 @@ class VkStorage:
                 (state, (error or "")[:2048] or None, _now_ms(), row_id),
             )
 
-    async def prepare_outbox(
+    async def prepare_outbox(  # noqa: PLR0913 - atomic replacement retains the original delivery contract
         self,
         peer_id: int,
         chunks: list[str],
@@ -323,6 +323,7 @@ class VkStorage:
         *,
         recoverable: bool = True,
         format_data: list[dict[str, object] | None] | None = None,
+        replace_rejected: OutboxRecord | None = None,
     ) -> list[OutboxRecord]:
         invocation_id = uuid.uuid4().hex
         now = _now_ms()
@@ -331,7 +332,40 @@ class VkStorage:
         if len(formats) != len(chunks):
             raise ValueError("format_data must align with chunks")
         async with self._transaction() as db:
+            first_index = 0
+            if replace_rejected is not None:
+                if not recoverable or not chunks:
+                    raise ValueError("a rejected text chunk requires recoverable replacements")
+                async with db.execute(
+                    "SELECT chunk_index FROM outbox WHERE id=? AND invocation_id=? AND peer_id=? "
+                    "AND state IN ('sending','delivery_unknown')",
+                    (replace_rejected.id, replace_rejected.invocation_id, peer_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("rejected outbox chunk is no longer owned by this invocation")
+                first_index = int(row[0])
+                # Retain the rejected wire request for diagnostics, but replace
+                # its logical position atomically. Recovery then sees one ordered
+                # invocation, including the replacements and original tail.
+                await db.execute(
+                    "UPDATE outbox SET invocation_id=?,chunk_index=0,state='failed',error=?,updated_at_ms=? WHERE id=?",
+                    (invocation_id, "VK rejected chunk at cached limit", now, replace_rejected.id),
+                )
+                invocation_id = replace_rejected.invocation_id
+                async with db.execute(
+                    "SELECT id,chunk_index FROM outbox WHERE invocation_id=? AND chunk_index>? "
+                    "ORDER BY chunk_index DESC",
+                    (invocation_id, first_index),
+                ) as cursor:
+                    tail = await cursor.fetchall()
+                for row_id, old_index in tail:
+                    await db.execute(
+                        "UPDATE outbox SET chunk_index=? WHERE id=?",
+                        (int(old_index) + len(chunks) - 1, row_id),
+                    )
             for index, (chunk, chunk_format) in enumerate(zip(chunks, formats, strict=True)):
+                chunk_index = first_index + index
                 format_json = canonical_json(chunk_format) if chunk_format else None
                 while True:
                     random_id = secrets.randbelow(2_147_483_647) + 1
@@ -343,7 +377,7 @@ class VkStorage:
                             invocation_id,
                             peer_id,
                             hashlib.sha256(chunk.encode()).hexdigest(),
-                            index,
+                            chunk_index,
                             random_id,
                             reply_target,
                             "prepared" if recoverable else "sending",
@@ -359,7 +393,7 @@ class VkStorage:
                                 int(cursor.lastrowid or 0),
                                 invocation_id,
                                 peer_id,
-                                index,
+                                chunk_index,
                                 random_id,
                                 chunk,
                                 reply_target,
@@ -382,7 +416,9 @@ class VkStorage:
                 "AND NOT EXISTS (SELECT 1 FROM outbox AS earlier "
                 "WHERE earlier.invocation_id=pending.invocation_id AND earlier.chunk_index<pending.chunk_index "
                 "AND (earlier.state NOT IN ('prepared','sent') "
-                "OR (earlier.state='prepared' AND earlier.wire_content IS NULL))) ORDER BY pending.id"
+                "OR (earlier.state='prepared' AND earlier.wire_content IS NULL))) "
+                "ORDER BY (SELECT MIN(first.id) FROM outbox AS first "
+                "WHERE first.invocation_id=pending.invocation_id),pending.chunk_index"
             ) as cursor:
                 rows = await cursor.fetchall()
             return [
