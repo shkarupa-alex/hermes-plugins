@@ -24,6 +24,7 @@ MAX_NORMALIZED_JSON_LENGTH = 262_144
 SCHEMA_VERSION = 3
 PREVIOUS_SCHEMA_VERSION = 2
 UPDATE_FIELDS = ("type", "object", "group_id", "event_id")
+CANCEL_CLEANUP_MAX_ATTEMPTS = 3
 logger = logging.getLogger(__name__)
 
 
@@ -279,20 +280,21 @@ class VkStorage:
         await db.rollback()
         if on_cancel is None:
             return
-        while True:
+        for attempt in range(CANCEL_CLEANUP_MAX_ATTEMPTS):
             try:
                 await db.execute("BEGIN IMMEDIATE")
                 await on_cancel(db)
                 await db.commit()
             except BaseException as exc:
                 await db.rollback()
-                if isinstance(exc, sqlite3.OperationalError) and getattr(exc, "sqlite_errorcode", None) in {
-                    sqlite3.SQLITE_BUSY,
-                    sqlite3.SQLITE_LOCKED,
-                }:
+                if (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and getattr(exc, "sqlite_errorcode", None) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    and attempt + 1 < CANCEL_CLEANUP_MAX_ATTEMPTS
+                ):
                     # Another connection can acquire the writer lock between
-                    # commit and cleanup. Retain ownership until it releases
-                    # the lock so cancelled rows never become recoverable.
+                    # commit and cleanup. Allow transient contention to clear,
+                    # but bound retries so shutdown releases this storage lock.
                     await asyncio.sleep(0.05)
                     continue
                 raise

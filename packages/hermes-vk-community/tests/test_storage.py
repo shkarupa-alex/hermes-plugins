@@ -136,8 +136,9 @@ async def test_cancelled_transaction_cannot_commit_or_rollback_another_writer(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("contention", ["transient", "persistent"])
 async def test_cancelled_preparation_commit_waits_for_another_sqlite_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, contention: str
 ) -> None:
     storage = VkStorage(tmp_path / "state.sqlite3")
     await storage.open()
@@ -166,14 +167,25 @@ async def test_cancelled_preparation_commit_waits_for_another_sqlite_writer(
     task = asyncio.create_task(storage.prepare_outbox(2, ["head", "tail"], None))
     try:
         await asyncio.wait_for(locked.wait(), 5)
-        await asyncio.sleep(0.1)  # cleanup must survive an actual SQLITE_BUSY result
+        await asyncio.sleep(0.02)  # cleanup must survive an actual SQLITE_BUSY result
         assert not task.done()
-        blocker.rollback()
+        if contention == "transient":
+            blocker.rollback()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 5)
+            await asyncio.wait_for(task, 2)
         assert not db.in_transaction
-        assert len(await storage.diagnostic_rows(outbox_state="failed")) == 2
-        assert await storage.prepared_outbox() == []
+        if contention == "transient":
+            assert len(await storage.diagnostic_rows(outbox_state="failed")) == 2
+            assert await storage.prepared_outbox() == []
+        else:
+            assert "cancellation cleanup failed" in caplog.text
+            assert len(await storage.prepared_outbox()) == 2
+            # Reads and close must progress even while the other writer remains
+            # locked; timeout exhaustion released VkStorage's connection lock.
+            await asyncio.wait_for(storage.counts(), 1)
+            await asyncio.wait_for(storage.close(), 1)
+            blocker.rollback()
+            await storage.open()
         await storage.create_pairing_code("NEXT", 60)
         assert await storage.consume_pairing_code("NEXT", 789)
     finally:
