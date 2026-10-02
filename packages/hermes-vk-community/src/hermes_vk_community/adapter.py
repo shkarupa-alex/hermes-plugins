@@ -630,7 +630,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             logger.warning("[vk] could not rechunk a rejected message: %s", type(exc).__name__)
             return None
 
-    async def _recover_prepared_outbox(self) -> None:
+    async def _recover_prepared_outbox(self) -> None:  # noqa: C901 - explicit authorization/ownership/delivery states
         if self._client is None or self._storage is None:
             return
         records = await self._storage.prepared_outbox()
@@ -643,6 +643,17 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 continue
             dispatched = False
             try:
+                if denied := await self._delivery_target_error(str(record.peer_id)):
+                    await self._storage.terminalize_outbox_failure(
+                        record,
+                        "failed",
+                        denied.error or "recovery target is no longer authorized",
+                        [],
+                        "blocked after access was revoked before recovery",
+                    )
+                    blocked_invocations.add(record.invocation_id)
+                    record_index += 1
+                    continue
                 await self._storage.mark_outbox(record.id, "sending")
                 dispatched = True
                 response = await self._send_chunk(

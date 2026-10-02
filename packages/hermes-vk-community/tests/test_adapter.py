@@ -485,6 +485,55 @@ async def test_lost_rechunk_ownership_preserves_the_other_senders_recoverable_ch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("access", ["allowlist_removed", "pairing_disabled", "pairing_revoked", "pairing_active"])
+async def test_recovery_rechecks_access_and_continues_authorized_invocations(tmp_path: Path, access: str) -> None:
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "group_id": 123,
+            "allowed_user_ids": [456, 999] if access == "allowlist_removed" else [456],
+            "pairing": {"enabled": True},
+        },
+    )
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    calls: list[dict[str, object]] = []
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    try:
+        if access.startswith("pairing"):
+            await storage.create_pairing_code("OLD", 60)
+            assert await storage.consume_pairing_code("OLD", 999)
+        admitted = build_adapter(config)
+        admitted._storage = storage
+        assert await admitted._delivery_target_error("999") is None
+        await storage.prepare_outbox(999, ["queued report", "queued tail"], None)
+        await storage.prepare_outbox(456, ["still authorized"], None)
+        if access == "pairing_revoked":
+            async with storage._transaction() as db:
+                await db.execute("DELETE FROM paired_users WHERE user_id=999")
+        await storage.close()
+        await storage.open()
+        config.extra["allowed_user_ids"] = [456]
+        config.extra["pairing"] = {"enabled": access != "pairing_disabled"}
+        restarted = build_adapter(config)
+        restarted._storage = storage
+        restarted._client = cast("Any", object())
+        restarted._send_chunk = transport
+        if access != "pairing_active":
+            assert not (await restarted.send("999", "ordinary send is forbidden")).success
+        await restarted._recover_prepared_outbox()
+        assert [call["peer_id"] for call in calls] == ([999, 999, 456] if access == "pairing_active" else [456])
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == (0 if access == "pairing_active" else 2)
+        assert await storage.prepared_outbox() == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["send", "direct", "recovery"])
 async def test_cancellation_before_dispatch_is_not_delivery_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
