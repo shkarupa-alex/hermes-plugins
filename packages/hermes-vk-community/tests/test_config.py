@@ -85,3 +85,16 @@ def test_live_certified_profile_enables_rich_mode() -> None:
 
 def test_runtime_never_reads_vk_token_with_os_getenv() -> None:
     assert 'os.getenv("VK_COMMUNITY_TOKEN")' not in inspect.getsource(adapter)
+
+
+def test_hermes_home_channel_does_not_invalidate_vk_config() -> None:
+    result = apply_yaml_config(
+        {},
+        {
+            "group_id": 123,
+            "allowed_user_ids": [456],
+            "home_channel": {"platform": "vk", "chat_id": "456", "name": "Reports"},
+        },
+    )
+    assert result["_vk_validation_errors"] == []
+    assert "home_channel" not in result

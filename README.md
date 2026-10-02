@@ -54,3 +54,30 @@ git config gitflow.prefix.versiontag ""
 получит из него версию пакетов `1.2.3`. Ручной запуск workflow принимает как
 `1.2.3`, так и `v1.2.3` и в обоих случаях ищет существующий тег `v1.2.3`.
 Значения вида `vv1.2.3`, prerelease-версии и версии с пробелами отклоняются.
+
+
+## Разработка и совместимость
+
+Основные проверки выполняются на Python 3.14. Пакеты плагинов сохраняют минимум
+Python 3.11; CI отдельно проверяет старые релизы Hermes на Python 3.11/3.13.
+Современный Hermes распространяется как исходный checkout и запрещает обычную
+сборку wheel. Для изолированного рабочего окружения из корня репозитория:
+
+```bash
+python3 tools/sync_workspace.py
+uv run --no-sync pytest -q
+uv run --no-sync ruff format --check .
+uv run --no-sync ruff check .
+uv run --no-sync pyright
+uv build --all-packages
+```
+
+Скрипт клонирует фиксированный SHA из `tool.uv.sources` в игнорируемый каталог
+`.hermes-agent`, устанавливает зависимости из `uv.lock` и подключает Hermes
+в editable-режиме. `--no-sync` сохраняет эту source-установку при запуске команд.
+Для обновления зависимостей используйте `uv lock --upgrade`, затем снова
+запустите скрипт. Рабочая пользовательская установка Hermes не затрагивается.
+
+ONNX Runtime обновлён до `1.30.x`: ASR проверяется на Linux, Windows и macOS
+Apple Silicon. У этого runtime нет колёс macOS Intel; VK на Intel проверяется
+отдельно. Настройка cron-отчётов: [VK Community](packages/hermes-vk-community/README.md#отчёты-cron-в-vk).

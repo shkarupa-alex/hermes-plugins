@@ -147,6 +147,8 @@ def _errors(exc: ValidationError) -> list[str]:
 
 def apply_yaml_config(_yaml_cfg: dict[str, Any], platform_cfg: dict[str, Any]) -> dict[str, Any]:
     raw = copy.deepcopy(platform_cfg)
+    # Hermes owns this shared field, including /sethome and cron resolution.
+    raw.pop("home_channel", None)
     if "VK_COMMUNITY_TOKEN" in raw or "access_token_env" in raw:
         return {"_vk_validation_errors": ["VK token configuration is allowed only in the profile .env"]}
     try:

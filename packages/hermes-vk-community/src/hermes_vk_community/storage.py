@@ -1,15 +1,20 @@
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
+import logging
 import secrets
+import sqlite3
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 import aiosqlite
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, Awaitable, Callable
     from pathlib import Path
 
     from hermes_vk_community.models import JsonObject
@@ -19,6 +24,13 @@ MAX_NORMALIZED_JSON_LENGTH = 262_144
 SCHEMA_VERSION = 3
 PREVIOUS_SCHEMA_VERSION = 2
 UPDATE_FIELDS = ("type", "object", "group_id", "event_id")
+CANCEL_CLEANUP_MAX_ATTEMPTS = 3
+logger = logging.getLogger(__name__)
+
+
+class OutboxOwnershipLostError(RuntimeError):
+    """Another sender has already replaced this logical outbox chunk."""
+
 
 SCHEMA = """
 CREATE TABLE schema_meta (
@@ -124,8 +136,9 @@ class VkStorage:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._db: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
-    async def open(self) -> None:
+    async def open(self, *, recover_inflight: bool = True) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
         self.path.chmod(0o600)
@@ -134,7 +147,8 @@ class VkStorage:
         await self._db.execute("PRAGMA synchronous=FULL")
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._migrate()
-        await self._db.execute("UPDATE outbox SET state='delivery_unknown' WHERE state='sending'")
+        if recover_inflight:
+            await self._db.execute("UPDATE outbox SET state='delivery_unknown' WHERE state='sending'")
         await self._db.commit()
 
     async def _migrate(self) -> None:
@@ -214,27 +228,90 @@ class VkStorage:
             raise RuntimeError(f"VK storage schema is incomplete; missing: {', '.join(sorted(missing))}")
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-        self._db = None
+        async with self._lock:
+            if self._db is not None:
+                await self._db.close()
+            self._db = None
 
     def _connection(self) -> aiosqlite.Connection:
         if self._db is None:
             raise RuntimeError("storage is not open")
         return self._db
 
+    @asynccontextmanager
+    async def _transaction(
+        self, *, on_cancel: Callable[[aiosqlite.Connection], Awaitable[None]] | None = None
+    ) -> AsyncGenerator[aiosqlite.Connection, None]:
+        # aiosqlite queues statements, not whole coroutine transactions. Every
+        # writer owns the connection until commit/rollback; readers use the same
+        # lock so they cannot act on another coroutine's uncommitted records.
+        async with self._lock:
+            db = self._connection()
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                yield db
+                await db.commit()
+            except asyncio.CancelledError as cancelled:
+                cleanup = asyncio.create_task(self._settle_cancelled_transaction(db, on_cancel))
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        # Retain the connection lock even if shutdown cancels
+                        # this task again while the worker finishes cleanup.
+                        continue
+                    except Exception:  # noqa: BLE001 - inspect cleanup failure without replacing cancellation
+                        break
+                try:
+                    cleanup.result()
+                except Exception as exc:
+                    logger.warning("[vk] cancellation cleanup failed: %s", type(exc).__name__, exc_info=True)
+                    cancelled.add_note(f"VK storage cleanup failed: {type(exc).__name__}")
+                raise
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def _settle_cancelled_transaction(
+        self, db: aiosqlite.Connection, on_cancel: Callable[[aiosqlite.Connection], Awaitable[None]] | None
+    ) -> None:
+        # The worker may commit before cancellation reaches its waiter. FIFO
+        # rollback settles that outcome before retiring the owned invocation.
+        await db.rollback()
+        if on_cancel is None:
+            return
+        for attempt in range(CANCEL_CLEANUP_MAX_ATTEMPTS):
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                await on_cancel(db)
+                await db.commit()
+            except BaseException as exc:
+                await db.rollback()
+                if (
+                    isinstance(exc, sqlite3.OperationalError)
+                    and getattr(exc, "sqlite_errorcode", None) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    and attempt + 1 < CANCEL_CLEANUP_MAX_ATTEMPTS
+                ):
+                    # Another connection can acquire the writer lock between
+                    # commit and cleanup. Allow transient contention to clear,
+                    # but bound retries so shutdown releases this storage lock.
+                    await asyncio.sleep(0.05)
+                    continue
+                raise
+            else:
+                return
+
     async def cursor(self, group_id: int) -> str | None:
-        db = self._connection()
-        async with db.execute("SELECT ts FROM long_poll_cursor WHERE group_id=?", (group_id,)) as cursor:
-            row = await cursor.fetchone()
-        return str(row[0]) if row else None
+        async with self._lock:
+            db = self._connection()
+            async with db.execute("SELECT ts FROM long_poll_cursor WHERE group_id=?", (group_id,)) as cursor:
+                row = await cursor.fetchone()
+            return str(row[0]) if row else None
 
     async def admit_batch(self, group_id: int, updates: list[JsonObject], ts: str) -> list[int]:
-        db = self._connection()
         now = _now_ms()
         inserted: list[int] = []
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
             for update in updates:
                 stable_update = normalize_update(update)
                 normalized = canonical_json(stable_update)
@@ -279,27 +356,23 @@ class VkStorage:
                 ON CONFLICT(group_id) DO UPDATE SET ts=excluded.ts,updated_at_ms=excluded.updated_at_ms""",
                 (group_id, ts, now),
             )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
         return inserted
 
     async def received(self) -> list[InboxRecord]:
-        db = self._connection()
-        async with db.execute("SELECT id,normalized_json FROM inbox WHERE state='received' ORDER BY id") as cursor:
-            rows = await cursor.fetchall()
-        return [InboxRecord(id=int(row[0]), normalized_json=str(row[1])) for row in rows]
+        async with self._lock:
+            db = self._connection()
+            async with db.execute("SELECT id,normalized_json FROM inbox WHERE state='received' ORDER BY id") as cursor:
+                rows = await cursor.fetchall()
+            return [InboxRecord(id=int(row[0]), normalized_json=str(row[1])) for row in rows]
 
     async def mark_inbox(self, row_id: int, state: InboxState, error: str | None = None) -> None:
-        db = self._connection()
-        await db.execute(
-            "UPDATE inbox SET state=?,attempts=attempts+1,error=?,updated_at_ms=? WHERE id=?",
-            (state, (error or "")[:2048] or None, _now_ms(), row_id),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                "UPDATE inbox SET state=?,attempts=attempts+1,error=?,updated_at_ms=? WHERE id=?",
+                (state, (error or "")[:2048] or None, _now_ms(), row_id),
+            )
 
-    async def prepare_outbox(
+    async def prepare_outbox(  # noqa: C901, PLR0913 - atomic preparation/replacement/cancellation ownership
         self,
         peer_id: int,
         chunks: list[str],
@@ -307,17 +380,67 @@ class VkStorage:
         *,
         recoverable: bool = True,
         format_data: list[dict[str, object] | None] | None = None,
+        replace_rejected: OutboxRecord | None = None,
+        replacement_token: str | None = None,
     ) -> list[OutboxRecord]:
-        db = self._connection()
-        invocation_id = uuid.uuid4().hex
+        replacement_token = replacement_token or uuid.uuid4().hex
+        invocation_id = replacement_token
         now = _now_ms()
         records: list[OutboxRecord] = []
         formats = format_data or [None] * len(chunks)
         if len(formats) != len(chunks):
             raise ValueError("format_data must align with chunks")
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+
+        async def cancel_preparation(db: aiosqlite.Connection) -> None:
+            if replace_rejected is not None and not await self._owns_outbox_failure(
+                db, replace_rejected, replacement_token
+            ):
+                return
+            await db.execute(
+                "UPDATE outbox SET state='failed',error=?,updated_at_ms=? WHERE invocation_id=? AND state=?",
+                (
+                    "outbox preparation cancelled before dispatch",
+                    _now_ms(),
+                    invocation_id,
+                    "prepared" if recoverable else "sending",
+                ),
+            )
+
+        async with self._transaction(on_cancel=cancel_preparation) as db:
+            first_index = 0
+            if replace_rejected is not None:
+                if not recoverable or not chunks:
+                    raise ValueError("a rejected text chunk requires recoverable replacements")
+                async with db.execute(
+                    "SELECT chunk_index FROM outbox WHERE id=? AND invocation_id=? AND peer_id=? "
+                    "AND state IN ('sending','delivery_unknown')",
+                    (replace_rejected.id, replace_rejected.invocation_id, peer_id),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None:
+                    raise OutboxOwnershipLostError("rejected outbox chunk is no longer owned by this invocation")
+                first_index = int(row[0])
+                # Retain the rejected wire request for diagnostics, but replace
+                # its logical position atomically. Recovery then sees one ordered
+                # invocation, including the replacements and original tail.
+                await db.execute(
+                    "UPDATE outbox SET invocation_id=?,chunk_index=0,state='failed',error=?,updated_at_ms=? WHERE id=?",
+                    (invocation_id, "VK rejected chunk at cached limit", now, replace_rejected.id),
+                )
+                invocation_id = replace_rejected.invocation_id
+                async with db.execute(
+                    "SELECT id,chunk_index FROM outbox WHERE invocation_id=? AND chunk_index>? "
+                    "ORDER BY chunk_index DESC",
+                    (invocation_id, first_index),
+                ) as cursor:
+                    tail = await cursor.fetchall()
+                for row_id, old_index in tail:
+                    await db.execute(
+                        "UPDATE outbox SET chunk_index=? WHERE id=?",
+                        (int(old_index) + len(chunks) - 1, row_id),
+                    )
             for index, (chunk, chunk_format) in enumerate(zip(chunks, formats, strict=True)):
+                chunk_index = first_index + index
                 format_json = canonical_json(chunk_format) if chunk_format else None
                 while True:
                     random_id = secrets.randbelow(2_147_483_647) + 1
@@ -329,7 +452,7 @@ class VkStorage:
                             invocation_id,
                             peer_id,
                             hashlib.sha256(chunk.encode()).hexdigest(),
-                            index,
+                            chunk_index,
                             random_id,
                             reply_target,
                             "prepared" if recoverable else "sending",
@@ -345,7 +468,7 @@ class VkStorage:
                                 int(cursor.lastrowid or 0),
                                 invocation_id,
                                 peer_id,
-                                index,
+                                chunk_index,
                                 random_id,
                                 chunk,
                                 reply_target,
@@ -353,49 +476,53 @@ class VkStorage:
                             )
                         )
                         break
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
         return records
 
     async def prepared_outbox(self) -> list[OutboxRecord]:
-        db = self._connection()
-        async with db.execute(
-            "SELECT id,invocation_id,peer_id,chunk_index,random_id,wire_content,reply_target,format_data_json "
-            "FROM outbox WHERE state='prepared' AND wire_content IS NOT NULL ORDER BY id"
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [
-            OutboxRecord(
-                id=int(row[0]),
-                invocation_id=str(row[1]),
-                peer_id=int(row[2]),
-                chunk_index=int(row[3]),
-                random_id=int(row[4]),
-                wire_content=str(row[5]),
-                reply_target=str(row[6]) if row[6] is not None else None,
-                format_data=cast("dict[str, object]", json.loads(str(row[7]))) if row[7] is not None else None,
-            )
-            for row in rows
-        ]
+        async with self._lock:
+            db = self._connection()
+            # Another process can still own an in-flight prefix. Recover its tail
+            # only after that prefix is confirmed, or replay the prepared prefix
+            # first using its persisted random_id.
+            async with db.execute(
+                "SELECT pending.id,pending.invocation_id,pending.peer_id,pending.chunk_index,pending.random_id,"
+                "pending.wire_content,pending.reply_target,pending.format_data_json "
+                "FROM outbox AS pending WHERE pending.state='prepared' AND pending.wire_content IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM outbox AS earlier "
+                "WHERE earlier.invocation_id=pending.invocation_id AND earlier.chunk_index<pending.chunk_index "
+                "AND (earlier.state NOT IN ('prepared','sent') "
+                "OR (earlier.state='prepared' AND earlier.wire_content IS NULL))) "
+                "ORDER BY (SELECT MIN(first.id) FROM outbox AS first "
+                "WHERE first.invocation_id=pending.invocation_id),pending.chunk_index"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return [
+                OutboxRecord(
+                    id=int(row[0]),
+                    invocation_id=str(row[1]),
+                    peer_id=int(row[2]),
+                    chunk_index=int(row[3]),
+                    random_id=int(row[4]),
+                    wire_content=str(row[5]),
+                    reply_target=str(row[6]) if row[6] is not None else None,
+                    format_data=cast("dict[str, object]", json.loads(str(row[7]))) if row[7] is not None else None,
+                )
+                for row in rows
+            ]
 
     async def create_pairing_code(self, code: str, ttl_seconds: int) -> None:
-        db = self._connection()
-        now = _now_ms()
-        digest = hashlib.sha256(code.strip().encode()).hexdigest()
-        await db.execute(
-            "INSERT INTO pairing_codes(code_sha256,expires_at_ms,created_at_ms) VALUES(?,?,?)",
-            (digest, now + ttl_seconds * 1000, now),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            now = _now_ms()
+            digest = hashlib.sha256(code.strip().encode()).hexdigest()
+            await db.execute(
+                "INSERT INTO pairing_codes(code_sha256,expires_at_ms,created_at_ms) VALUES(?,?,?)",
+                (digest, now + ttl_seconds * 1000, now),
+            )
 
     async def consume_pairing_code(self, code: str, user_id: int) -> bool:
-        db = self._connection()
         now = _now_ms()
         digest = hashlib.sha256(code.strip().encode()).hexdigest()
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
             cursor = await db.execute(
                 "UPDATE pairing_codes SET consumed_at_ms=?,consumed_by_user_id=? "
                 "WHERE code_sha256=? AND consumed_at_ms IS NULL AND expires_at_ms>=?",
@@ -406,125 +533,133 @@ class VkStorage:
                 await db.execute(
                     "INSERT OR REPLACE INTO paired_users(user_id,paired_at_ms) VALUES(?,?)", (user_id, now)
                 )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
         return consumed
 
     async def is_paired(self, user_id: int) -> bool:
-        db = self._connection()
-        async with db.execute("SELECT 1 FROM paired_users WHERE user_id=?", (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
+        async with self._lock:
+            db = self._connection()
+            async with db.execute("SELECT 1 FROM paired_users WHERE user_id=?", (user_id,)) as cursor:
+                return await cursor.fetchone() is not None
 
     async def record_media_orphan(self, kind: str, peer_id: int, upload_fingerprint: str, error: str) -> None:
-        db = self._connection()
-        await db.execute(
-            "INSERT INTO media_orphans(kind,peer_id,upload_sha256,error,created_at_ms) VALUES(?,?,?,?,?)",
-            (kind[:32], peer_id, upload_fingerprint[:64], error[:2048], _now_ms()),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO media_orphans(kind,peer_id,upload_sha256,error,created_at_ms) VALUES(?,?,?,?,?)",
+                (kind[:32], peer_id, upload_fingerprint[:64], error[:2048], _now_ms()),
+            )
 
     async def mark_outbox(
         self, row_id: int, state: str, *, message_id: str | None = None, error: str | None = None
     ) -> None:
-        db = self._connection()
-        await db.execute(
-            """UPDATE outbox SET state=?,attempt_count=attempt_count+CASE WHEN ?='sending' THEN 1 ELSE 0 END,
-            returned_message_id=?,error=?,updated_at_ms=?
-            WHERE id=?""",
-            (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                """UPDATE outbox SET state=?,attempt_count=attempt_count+CASE WHEN ?='sending' THEN 1 ELSE 0 END,
+                returned_message_id=?,error=?,updated_at_ms=?
+                WHERE id=?""",
+                (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
+            )
 
-    async def terminalize_outbox_failure(
+    @staticmethod
+    async def _owns_outbox_failure(
+        db: aiosqlite.Connection, record: OutboxRecord, replacement_token: str | None
+    ) -> bool:
+        # The rejected physical row moves to a per-attempt diagnostic invocation
+        # on replacement. Its token proves whose replacement actually committed.
+        # Check under the cleanup's writer transaction, including cancellation
+        # before the replacement transaction could inspect the rejected row.
+        async with db.execute("SELECT invocation_id FROM outbox WHERE id=?", (record.id,)) as cursor:
+            row = await cursor.fetchone()
+        return row is not None and str(row[0]) in {record.invocation_id, replacement_token}
+
+    async def terminalize_outbox_failure(  # noqa: PLR0913 - durable cleanup includes replacement ownership evidence
         self,
         record: OutboxRecord,
         state: str,
         error: str,
         tail_records: list[OutboxRecord],
         tail_error: str,
-    ) -> None:
-        """Atomically terminate a failed chunk and every later prepared chunk."""
-        db = self._connection()
+        *,
+        replacement_token: str | None = None,
+    ) -> bool:
+        """Terminate owned chunks atomically, returning False if ownership moved."""
         now = _now_ms()
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
+            if not await self._owns_outbox_failure(db, record, replacement_token):
+                return False
             await db.execute(
                 "UPDATE outbox SET state=?,error=?,updated_at_ms=? WHERE id=?",
                 (state, (error or "delivery failed")[:2048], now, record.id),
             )
-            if tail_records:
-                placeholders = ",".join("?" for _ in tail_records)
-                await db.execute(
-                    f"UPDATE outbox SET state='failed',error=?,updated_at_ms=? "  # noqa: S608 - IDs use placeholders
-                    f"WHERE state='prepared' AND id IN ({placeholders})",
-                    (
-                        (tail_error or "unsent tail is terminal")[:2048],
-                        now,
-                        *(item.id for item in tail_records),
-                    ),
-                )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
+            # A rechunk transaction may have committed new records before its
+            # caller was cancelled. Include the durable invocation, rather than
+            # relying only on the caller's earlier in-memory snapshot.
+            tail_ids = [record.id, *(item.id for item in tail_records)]
+            placeholders = ",".join("?" for _ in tail_ids)
+            await db.execute(
+                f"UPDATE outbox SET state='failed',error=?,updated_at_ms=? "  # noqa: S608 - IDs use placeholders
+                f"WHERE state='prepared' AND (invocation_id=? OR id IN ({placeholders}))",
+                ((tail_error or "unsent tail is terminal")[:2048], now, record.invocation_id, *tail_ids),
+            )
+        return True
 
     async def counts(self) -> dict[str, int]:
-        db = self._connection()
-        result: dict[str, int] = {}
-        for table, state in (("inbox", "dispatched"), ("outbox", "delivery_unknown")):
-            async with db.execute(f"SELECT count(*) FROM {table} WHERE state=?", (state,)) as cursor:  # noqa: S608
+        async with self._lock:
+            db = self._connection()
+            result: dict[str, int] = {}
+            for table, state in (("inbox", "dispatched"), ("outbox", "delivery_unknown")):
+                async with db.execute(f"SELECT count(*) FROM {table} WHERE state=?", (state,)) as cursor:  # noqa: S608
+                    row = await cursor.fetchone()
+                result[f"{table}_{state}"] = int(row[0]) if row else 0
+            async with db.execute("SELECT count(*) FROM media_orphans") as cursor:
                 row = await cursor.fetchone()
-            result[f"{table}_{state}"] = int(row[0]) if row else 0
-        async with db.execute("SELECT count(*) FROM media_orphans") as cursor:
-            row = await cursor.fetchone()
-        result["media_orphans"] = int(row[0]) if row else 0
-        return result
+            result["media_orphans"] = int(row[0]) if row else 0
+            return result
 
     async def diagnostic_rows(
         self, *, inbox_state: str | None = None, outbox_state: str | None = None
     ) -> list[dict[str, object]]:
-        db = self._connection()
-        result: list[dict[str, object]] = []
-        if inbox_state is not None:
-            async with db.execute(
-                "SELECT id,group_id,event_id,peer_id,attempts,error,updated_at_ms FROM inbox WHERE state=? ORDER BY id",
-                (inbox_state,),
-            ) as cursor:
-                result.extend(
-                    {
-                        "kind": "inbox",
-                        "id": int(row[0]),
-                        "group_id": int(row[1]),
-                        "event_id": row[2],
-                        "peer_id": row[3],
-                        "attempts": int(row[4]),
-                        "error": row[5],
-                        "updated_at_ms": int(row[6]),
-                    }
-                    for row in await cursor.fetchall()
-                )
-        if outbox_state is not None:
-            async with db.execute(
-                "SELECT id,invocation_id,peer_id,chunk_index,attempt_count,error,updated_at_ms "
-                "FROM outbox WHERE state=? ORDER BY id",
-                (outbox_state,),
-            ) as cursor:
-                result.extend(
-                    {
-                        "kind": "outbox",
-                        "id": int(row[0]),
-                        "invocation_id": str(row[1]),
-                        "peer_id": int(row[2]),
-                        "chunk_index": int(row[3]),
-                        "attempt_count": int(row[4]),
-                        "error": row[5],
-                        "updated_at_ms": int(row[6]),
-                    }
-                    for row in await cursor.fetchall()
-                )
-        return result
+        async with self._lock:
+            db = self._connection()
+            result: list[dict[str, object]] = []
+            if inbox_state is not None:
+                async with db.execute(
+                    "SELECT id,group_id,event_id,peer_id,attempts,error,updated_at_ms "
+                    "FROM inbox WHERE state=? ORDER BY id",
+                    (inbox_state,),
+                ) as cursor:
+                    result.extend(
+                        {
+                            "kind": "inbox",
+                            "id": int(row[0]),
+                            "group_id": int(row[1]),
+                            "event_id": row[2],
+                            "peer_id": row[3],
+                            "attempts": int(row[4]),
+                            "error": row[5],
+                            "updated_at_ms": int(row[6]),
+                        }
+                        for row in await cursor.fetchall()
+                    )
+            if outbox_state is not None:
+                async with db.execute(
+                    "SELECT id,invocation_id,peer_id,chunk_index,attempt_count,error,updated_at_ms "
+                    "FROM outbox WHERE state=? ORDER BY id",
+                    (outbox_state,),
+                ) as cursor:
+                    result.extend(
+                        {
+                            "kind": "outbox",
+                            "id": int(row[0]),
+                            "invocation_id": str(row[1]),
+                            "peer_id": int(row[2]),
+                            "chunk_index": int(row[3]),
+                            "attempt_count": int(row[4]),
+                            "error": row[5],
+                            "updated_at_ms": int(row[6]),
+                        }
+                        for row in await cursor.fetchall()
+                    )
+            return result
 
 
 def _now_ms() -> int:

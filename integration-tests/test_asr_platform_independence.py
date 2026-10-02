@@ -1,11 +1,18 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from agent import transcription_registry
 from agent.transcription_provider import TranscriptionProvider
-from agent.transcription_registry import _reset_for_tests, register_provider
 from tools.transcription_tools import _dispatch_to_plugin_provider
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# New Hermes exports registry functions dynamically; retain typed test call sites.
+_reset_for_tests = cast("Callable[[], None]", vars(transcription_registry)["_reset_for_tests"])
+register_provider = cast("Callable[[TranscriptionProvider], None]", vars(transcription_registry)["register_provider"])
 
 
 class RecordingProvider(TranscriptionProvider):
