@@ -2,7 +2,7 @@
 name = "hermes-plugins-workspace"
 version = "0.0.0"
 description = "Development workspace for Hermes VK Community and ONNX ASR plugins"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11"
 dependencies = []
 
 [dependency-groups]

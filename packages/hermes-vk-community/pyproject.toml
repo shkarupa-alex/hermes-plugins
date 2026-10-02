@@ -7,7 +7,7 @@ name = "hermes-vk-community"
 dynamic = ["version"]
 description = "VK Community Long Poll platform plugin for Hermes Agent"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Hermes VK Community contributors" }]
 dependencies = [
