@@ -31,6 +31,7 @@ from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
 
 from hermes_vk_community.capabilities import rich_capability_ready
 from hermes_vk_community.client import VkApiClient
+from hermes_vk_community.compat import supports_cron_delivery
 from hermes_vk_community.config import PolicyEnvironment, VkSettings, settings_from_platform_config
 from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import (
@@ -293,10 +294,10 @@ class VkCommunityAdapter(BasePlatformAdapter):
             delivered.extend(segment_ids)
             partial = _partial_delivery_payload(result)
             if partial is not None:
-                return _partial_send_failure(delivered, partial)
+                return _partial_send_result(delivered, partial)
             if not result.success:
                 if delivered:
-                    return _partial_send_failure(delivered, {"failed_segment": type(segment).__name__})
+                    return _partial_send_result(delivered, {"failed_segment": type(segment).__name__})
                 return result
         return SendResult(
             success=True,
@@ -373,13 +374,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                         [item[0] for item in pending],
                         delivered_characters=pending[index - 1][4],
                     )
-                return SendResult(
-                    success=False,
-                    error="VK delivery timed out after the request may have succeeded",
-                    retryable=False,
-                    error_kind="unknown",
-                    raw_response={"delivery_unknown": True, "outbox_id": record.id},
-                )
+                return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
             except VkApiError as exc:
                 if exc.code == VK_TOO_LONG_ERROR and self._effective_limit > MIN_MESSAGE_LIMIT:
                     await self._storage.mark_outbox(record.id, "failed", error="VK rejected chunk at cached limit")
@@ -439,13 +434,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                         [item[0] for item in pending],
                         delivered_characters=pending[index - 1][4],
                     )
-                return SendResult(
-                    success=False,
-                    error="VK delivery timed out after the request may have started",
-                    retryable=False,
-                    error_kind="unknown",
-                    raw_response={"delivery_unknown": True, "outbox_id": record.id},
-                )
+                return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
             index += 1
         return SendResult(
             success=True,
@@ -528,25 +517,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id, retryable=False)
         except VkDeliveryUnknownError:
             await self._storage.mark_outbox(record.id, "delivery_unknown", error="request timed out")
-            return SendResult(
-                success=False,
-                error="VK delivery timed out after the request may have succeeded",
-                retryable=False,
-                error_kind="unknown",
-                raw_response={"delivery_unknown": True, "outbox_id": record.id},
-            )
+            return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
         except VkApiError as exc:
             await self._storage.mark_outbox(record.id, "failed", error=_safe_api_error(exc))
             return _api_error_result(exc)
         except Exception as exc:  # noqa: BLE001 - the request may already have reached VK
             await self._storage.mark_outbox(record.id, "delivery_unknown", error=type(exc).__name__)
-            return SendResult(
-                success=False,
-                error="VK delivery timed out after the request may have started",
-                retryable=False,
-                error_kind="unknown",
-                raw_response={"delivery_unknown": True, "outbox_id": record.id},
-            )
+            return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
 
     async def _recover_prepared_outbox(self) -> None:
         if self._client is None or self._storage is None:
@@ -1415,10 +1392,31 @@ def _safe_api_error(exc: VkApiError) -> str:
     return messages.get(exc.code, f"VK rejected the request (error {exc.code}).")
 
 
-def _partial_send_failure(delivered: list[str], partial: dict[str, object]) -> SendResult:
+def _delivery_unknown_result(error: str, outbox_id: int) -> SendResult:
+    # The first request may already be visible. Hermes' live cron router only
+    # suppresses standalone fallback for partial_overflow; retain the distinct
+    # unknown diagnostic and report zero confirmed chunks.
     return SendResult(
         success=False,
-        error="VK message was only partially delivered",
+        error=error,
+        retryable=False,
+        error_kind="unknown",
+        raw_response={
+            "delivery_unknown": True,
+            "outbox_id": outbox_id,
+            "partial_overflow": True,
+            "delivered_chunks": 0,
+        },
+    )
+
+
+def _partial_send_result(delivered: list[str], partial: dict[str, object]) -> SendResult:
+    # Old hosts resend the entire payload after any failure. Keep their original
+    # visible-prefix result for ordinary chat; VK cron is unsupported there.
+    safe_routing = supports_cron_delivery()
+    return SendResult(
+        success=not safe_routing,
+        error="VK message was only partially delivered" if safe_routing else None,
         message_id=delivered[-1],
         continuation_message_ids=tuple(delivered[:-1]),
         retryable=False,

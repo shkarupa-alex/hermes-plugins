@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import importlib
+import threading
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -13,7 +14,8 @@ from gateway.platforms.base import SendResult
 from hermes_vk_community import adapter as adapter_module
 from hermes_vk_community import plugin as plugin_module
 from hermes_vk_community.adapter import VkCommunityAdapter
-from hermes_vk_community.errors import VkApiError
+from hermes_vk_community.compat import supports_cron_delivery
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError
 from hermes_vk_community.plugin import build_adapter, register, send_standalone
 from hermes_vk_community.storage import VkStorage
 
@@ -39,6 +41,8 @@ def _config(tmp_path: Path) -> PlatformConfig:
 
 @pytest.fixture
 def delivery_client(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    if not supports_cron_delivery():
+        pytest.skip("VK cron requires the current Hermes no-resend contract")
     events: list[str] = []
 
     class Client:
@@ -273,6 +277,7 @@ async def test_live_media_rejects_non_allowlisted_target_before_io(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not supports_cron_delivery(), reason="standalone cron is not registered on this host")
 async def test_hermes_standalone_media_requires_nonempty_report_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -354,6 +359,8 @@ async def test_partial_report_is_a_failure_without_duplicate_head(
     try:
         content = "x" * 600
         if lane == "live_router":
+            if not supports_cron_delivery():
+                pytest.skip("old-host VK cron is unsupported")
             platform = Platform("vk")
             router = DeliveryRouter(GatewayConfig(platforms={platform: config}), adapters={platform: instance})
             target = DeliveryTarget(platform=platform, chat_id="456", is_explicit=True)
@@ -365,7 +372,7 @@ async def test_partial_report_is_a_failure_without_duplicate_head(
                 if lane == "gateway_retry"
                 else await instance.send("456", content)
             )
-            assert not result.success
+            assert result.success is (not supports_cron_delivery())
             assert not result.retryable
             assert result.message_id == "42"
             raw = cast("dict[str, Any]", result.raw_response)
@@ -379,11 +386,86 @@ async def test_partial_report_is_a_failure_without_duplicate_head(
                 delivery = importlib.import_module("cron.scheduler")
             confirm = getattr(delivery, "_confirm_adapter_delivery", None)
             if confirm is not None:
-                assert not confirm(result)
+                assert bool(confirm(result)) is (not supports_cron_delivery())
         assert len(chunks) == 2  # no plain-text fallback or whole-report retry
         assert len(await instance._storage.prepared_outbox()) == 0
     finally:
         await instance._storage.close()
+
+
+@pytest.mark.asyncio
+async def test_standalone_rejects_host_without_no_resend_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(plugin_module, "supports_cron_delivery", lambda: False)
+
+    def forbidden(_config: PlatformConfig) -> VkCommunityAdapter:
+        pytest.fail("unsupported host must not create a cron sender")
+
+    monkeypatch.setattr(plugin_module, "build_adapter", forbidden)
+    result = await send_standalone(_config(tmp_path), "456", "Отчёт")
+    assert "requires a current Hermes Git host" in str(result["error"])
+
+
+@pytest.mark.skipif(not supports_cron_delivery(), reason="old-host VK cron is unsupported")
+def test_live_cron_ambiguous_first_request_never_falls_back_to_new_random_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_client: list[str],
+) -> None:
+    from cron import scheduler_delivery as delivery
+
+    from tools import send_message_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    gateway = GatewayConfig(platforms={Platform("vk"): config})
+    instance = build_adapter(config)
+    calls: list[dict[str, object]] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        calls.append(params)
+        if len(calls) == 1:
+            raise VkDeliveryUnknownError("VK accepted the report, but its response was lost")
+        return 42
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: gateway)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+
+    # If a fallback were attempted, force it into the registered standalone
+    # sender, so the genuine durable pipeline would allocate another random_id.
+    def no_live_adapter(_platform: object) -> tuple[None, None]:
+        return None, None
+
+    monkeypatch.setattr(send_message_tool, "_live_adapter", no_live_adapter)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+
+    async def setup() -> None:
+        instance._storage = VkStorage(tmp_path / "state.sqlite3")
+        await instance._storage.open()
+        instance._client = adapter_module.VkApiClient("profile-token")
+        await instance._client.open()
+
+    asyncio.run_coroutine_threadsafe(setup(), loop).result(timeout=5)
+    try:
+        result = cast("Any", delivery)._deliver_result(
+            {"id": "test", "deliver": "vk:456"}, "Отчёт", adapters={Platform("vk"): instance}, loop=loop
+        )
+        assert result
+        assert "may have succeeded" in result
+        assert len(calls) == 1
+        assert "random_id" in calls[0]
+        # No second adapter/client was created by the standalone fallback.
+        assert delivery_client == ["created", "opened"]
+    finally:
+        asyncio.run_coroutine_threadsafe(instance._close_resources(release_lock=False), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
 
 
 def test_cron_lists_vk_and_resolves_home_and_explicit_targets(
@@ -419,6 +501,10 @@ def test_cron_lists_vk_and_resolves_home_and_explicit_targets(
         # Old Hermes resolves bare platforms only through the env mirror.
         monkeypatch.setenv("VK_HOME_CHANNEL", "456")
     targets = delivery.cron_delivery_targets()
+    if not supports_cron_delivery():
+        assert all(target["id"] != "vk" for target in targets)
+        assert isinstance(build_adapter(config), VkCommunityAdapter)
+        return
     assert {"id": "vk", "name": "Vk", "home_target_set": True, "home_env_var": "VK_HOME_CHANNEL"} in targets
     for target in ("vk", "vk:456"):
         resolved = delivery._resolve_delivery_targets({"deliver": target})

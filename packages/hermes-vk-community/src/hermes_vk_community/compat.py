@@ -9,6 +9,12 @@ from packaging.version import Version
 MIN_HERMES = Version("0.18.2")
 
 
+def supports_cron_delivery() -> bool:
+    from gateway import delivery  # noqa: PLC0415 - probe optional host contract
+
+    return hasattr(BasePlatformAdapter, "_is_partial_delivery") and hasattr(delivery, "PartialDeliveryError")
+
+
 def _shape(function: object) -> tuple[tuple[str, int, bool], ...]:
     return tuple(
         (parameter.name, int(parameter.kind), parameter.default is not inspect.Parameter.empty)

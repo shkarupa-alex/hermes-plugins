@@ -5,6 +5,7 @@ from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_vk_community.adapter import VkCommunityAdapter
+from hermes_vk_community.compat import supports_cron_delivery
 from hermes_vk_community.plugin import build_adapter, is_connected, register
 
 if TYPE_CHECKING:
@@ -27,8 +28,12 @@ def test_register_exposes_pinned_hermes_contract() -> None:
     context = ContextRecorder()
     register(context)
     assert context.platform["name"] == "vk"
-    assert context.platform["cron_deliver_env_var"] == "VK_HOME_CHANNEL"
-    assert callable(context.platform["standalone_sender_fn"])
+    if supports_cron_delivery():
+        assert context.platform["cron_deliver_env_var"] == "VK_HOME_CHANNEL"
+        assert callable(context.platform["standalone_sender_fn"])
+    else:
+        assert "cron_deliver_env_var" not in context.platform
+        assert "standalone_sender_fn" not in context.platform
     assert context.platform["required_env"] == ["VK_COMMUNITY_TOKEN"]
     assert context.platform["max_message_length"] == 4096
     assert context.platform["allow_update_command"] is False
@@ -36,6 +41,15 @@ def test_register_exposes_pinned_hermes_contract() -> None:
     assert callable(context.platform["setup_fn"])
     assert callable(context.platform["is_connected"])
     assert context.command["name"] == "vk"
+
+
+def test_old_host_contract_does_not_advertise_cron(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("hermes_vk_community.plugin.supports_cron_delivery", lambda: False)
+    context = ContextRecorder()
+    register(context)
+    assert "cron_deliver_env_var" not in context.platform
+    assert "standalone_sender_fn" not in context.platform
+    assert callable(context.platform["adapter_factory"])
 
 
 def test_adapter_factory_builds_real_hermes_subclass() -> None:
