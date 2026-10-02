@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -23,7 +24,7 @@ from hermes_vk_community.adapter import (
 from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import InteractionPayload, LongPollLease, LongPollResponse, VkAttachment, VkMessage
 from hermes_vk_community.plugin import build_adapter
-from hermes_vk_community.renderer import RenderedTableSegment, RenderedTextSegment, RichVkRenderer
+from hermes_vk_community.renderer import RenderedTableSegment, RenderedTextSegment, RenderedVkMessage, RichVkRenderer
 from hermes_vk_community.storage import InboxRecord, VkStorage
 
 if TYPE_CHECKING:
@@ -530,6 +531,82 @@ async def test_recovery_rechecks_access_and_continues_authorized_invocations(tmp
         assert len(await storage.diagnostic_rows(outbox_state="failed")) == (0 if access == "pairing_active" else 2)
         assert await storage.prepared_outbox() == []
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["next_chunk", "sent_commit", "next_segment", "rechunk", "direct", "table_page"])
+async def test_confirmed_ids_survive_failed_sqlite_diagnostic_writes(  # noqa: C901 - distinct real SQLite failure boundaries
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512 if boundary == "rechunk" else 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    await storage._connection().execute("PRAGMA busy_timeout=0")
+    blocker = sqlite3.connect(storage.path)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    calls: list[dict[str, object]] = []
+    original_mark = storage.mark_outbox
+
+    async def mark_then_contend(row_id: int, state: str, **kwargs: Any) -> None:  # noqa: ANN401 - storage contract
+        await original_mark(row_id, state, **kwargs)
+        if state == "sent" and boundary in {"next_chunk", "next_segment"}:
+            blocker.execute("BEGIN IMMEDIATE")
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        if boundary in {"sent_commit", "direct"} or (boundary in {"rechunk", "table_page"} and len(calls) == 2):
+            blocker.execute("BEGIN IMMEDIATE")
+        if boundary == "rechunk" and len(calls) == 2:
+            raise VkApiError(914, "too long")
+        return 41 + len(calls)
+
+    monkeypatch.setattr(storage, "mark_outbox", mark_then_contend)
+    adapter._send_chunk = transport
+    if boundary in {"next_segment", "table_page"}:
+
+        def render(_content: str) -> RenderedVkMessage:
+            return RenderedVkMessage(
+                "headtail",
+                None,
+                "headtail",
+                frozenset(),
+                (RenderedTableSegment(("header",), (("cell",),)),)
+                if boundary == "table_page"
+                else (RenderedTextSegment("head"), RenderedTextSegment("tail")),
+            )
+
+        adapter._renderer = cast("Any", SimpleNamespace(render_markdown=render))
+    if boundary == "table_page":
+
+        def table_paths(_table: RenderedTableSegment, _directory: Path) -> list[Path]:
+            return [tmp_path / "1.jpg", tmp_path / "2.jpg"]
+
+        monkeypatch.setattr("hermes_vk_community.adapter.render_table_jpegs", table_paths)
+
+        async def upload(peer_id: int, path: Path) -> str:
+            return f"photo{peer_id}_{path.stem}"
+
+        adapter._upload_photo = upload
+    try:
+        result = (
+            await adapter._send_direct(456, "caption", attachment="doc1_1")
+            if boundary == "direct"
+            else await adapter._send_with_retry("456", "x" * 1100, base_delay=0)
+        )
+        assert result.message_id == ("43" if boundary == "table_page" else "42")
+        assert not result.retryable
+        raw = cast("dict[str, Any]", result.raw_response)
+        assert raw["partial_overflow"]
+        assert raw["delivered_chunks"] == (2 if boundary == "table_page" else 1)
+        if boundary in {"next_chunk", "sent_commit", "rechunk"}:
+            assert raw["partial_delivery"]["delivered_characters"] == (512 if boundary == "rechunk" else 256)
+        assert len(calls) == (2 if boundary in {"rechunk", "table_page"} else 1)
+    finally:
+        blocker.rollback()
+        blocker.close()
         await storage.close()
 
 

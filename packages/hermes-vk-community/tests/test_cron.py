@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import importlib
+import sqlite3
 import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -776,6 +777,78 @@ async def test_standalone_rejects_host_without_no_resend_contract(
     monkeypatch.setattr(plugin_module, "build_adapter", forbidden)
     result = await send_standalone(_config(tmp_path), "456", "Отчёт")
     assert "requires a current Hermes Git host" in str(result["error"])
+
+
+@pytest.mark.skipif(not supports_cron_delivery(), reason="old-host VK cron is unsupported")
+@pytest.mark.parametrize("boundary", ["next_chunk", "sent_commit", "rechunk"])
+def test_live_cron_sqlite_contention_never_replays_confirmed_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery_client: list[str], boundary: str
+) -> None:
+    from cron import scheduler_delivery as delivery
+
+    from tools import send_message_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    gateway = GatewayConfig(platforms={Platform("vk"): config})
+    instance = build_adapter(config)
+    instance._effective_limit = 512 if boundary == "rechunk" else 256
+    blocker = sqlite3.connect(tmp_path / "state.sqlite3", check_same_thread=False)
+    calls: list[dict[str, object]] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        calls.append(params)
+        if boundary == "sent_commit" or (boundary == "rechunk" and len(calls) == 2):
+            blocker.execute("BEGIN IMMEDIATE")
+        if boundary == "rechunk" and len(calls) == 2:
+            raise VkApiError(914, "too long")
+        return 42
+
+    def no_live_adapter(_platform: object) -> tuple[None, None]:
+        return None, None
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: gateway)
+    monkeypatch.setattr(send_message_tool, "_live_adapter", no_live_adapter)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+
+    async def setup() -> None:
+        storage = VkStorage(tmp_path / "state.sqlite3")
+        await storage.open()
+        await storage._connection().execute("PRAGMA busy_timeout=0")
+        original_mark = storage.mark_outbox
+
+        async def mark_then_contend(row_id: int, state: str, **kwargs: Any) -> None:  # noqa: ANN401 - storage contract
+            await original_mark(row_id, state, **kwargs)
+            if state == "sent" and boundary == "next_chunk":
+                blocker.execute("BEGIN IMMEDIATE")
+
+        monkeypatch.setattr(storage, "mark_outbox", mark_then_contend)
+        instance._storage = storage
+        instance._client = adapter_module.VkApiClient("profile-token")
+        await instance._client.open()
+
+    asyncio.run_coroutine_threadsafe(setup(), loop).result(timeout=5)
+    try:
+        result = cast("Any", delivery)._deliver_result(
+            {"id": "sqlite-contention", "deliver": "vk:456"},
+            "x" * 1100,
+            adapters={Platform("vk"): instance},
+            loop=loop,
+        )
+        assert result
+        assert "partially delivered" in result
+        assert len(calls) == (2 if boundary == "rechunk" else 1)
+        assert delivery_client == ["created", "opened"]  # no standalone adapter or fresh invocation
+    finally:
+        blocker.rollback()
+        blocker.close()
+        asyncio.run_coroutine_threadsafe(instance._close_resources(release_lock=False), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
 
 
 @pytest.mark.skipif(not supports_cron_delivery(), reason="old-host VK cron is unsupported")

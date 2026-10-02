@@ -67,6 +67,7 @@ from tools import slash_confirm
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from hermes_vk_community.renderer import RenderedVkSegment
     from hermes_vk_community.storage import OutboxRecord
 
 logger = logging.getLogger(__name__)
@@ -308,28 +309,24 @@ class VkCommunityAdapter(BasePlatformAdapter):
         delivered: list[str] = []
         for segment in rendered.segments:
             segment_reply = reply_to if not delivered else None
-            if isinstance(segment, RenderedTextSegment):
-                if not segment.text:
-                    continue
-                result = await self._send_text_segment(int(chat_id), segment, segment_reply)
-            elif isinstance(segment, RenderedTableSegment):
-                result = await self._send_table_segment(int(chat_id), segment, segment_reply)
-            else:
-                result = await self.send_image(
-                    chat_id,
-                    segment.url,
-                    caption=segment.alt or None,
-                    reply_to=segment_reply,
-                )
+            if isinstance(segment, RenderedTextSegment) and not segment.text:
+                continue
+            try:
+                result = await self._send_rendered_segment(chat_id, segment, segment_reply)
+            except Exception as exc:
+                if not delivered:
+                    raise
+                logger.warning("[vk] segment failed after confirmed delivery: %s", type(exc).__name__)
+                return _partial_send_result(delivered, {"failed_segment": type(segment).__name__})
             segment_ids = _send_result_ids(result)
             delivered.extend(segment_ids)
             partial = _partial_delivery_payload(result)
             if partial is not None:
                 return _partial_send_result(delivered, partial)
             if not result.success:
-                if delivered:
-                    return _partial_send_result(delivered, {"failed_segment": type(segment).__name__})
-                return result
+                return (
+                    _partial_send_result(delivered, {"failed_segment": type(segment).__name__}) if delivered else result
+                )
         return SendResult(
             success=True,
             message_id=delivered[-1] if delivered else None,
@@ -364,6 +361,25 @@ class VkCommunityAdapter(BasePlatformAdapter):
     def _send_retry_is_final(self, result: SendResult) -> bool:
         return _may_have_delivered(result) or (result.error_kind is not None and not result.retryable)
 
+    async def _send_rendered_segment(
+        self, chat_id: str, segment: RenderedVkSegment, reply_to: str | None
+    ) -> SendResult:
+        if isinstance(segment, RenderedTextSegment):
+            return await self._send_text_segment(int(chat_id), segment, reply_to)
+        if isinstance(segment, RenderedTableSegment):
+            return await self._send_table_segment(int(chat_id), segment, reply_to)
+        return await self.send_image(chat_id, segment.url, caption=segment.alt or None, reply_to=reply_to)
+
+    async def _terminalize_failed_send(
+        self, record: OutboxRecord, state: str, error: str, tail_records: list[OutboxRecord], tail_error: str
+    ) -> None:
+        if self._storage is None:
+            return
+        try:
+            await self._storage.terminalize_outbox_failure(record, state, error, tail_records, tail_error)
+        except Exception as exc:
+            logger.warning("[vk] failed to persist send diagnostics: %s", type(exc).__name__, exc_info=True)
+
     async def _send_text_segment(  # noqa: C901, PLR0911, PLR0912 - explicit durable failure/cancellation/ownership states
         self,
         peer_id: int,
@@ -377,6 +393,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         formats = [format_data_for_chunk(rendered.format_data, chunk) for chunk in wire_chunks]
         outbox = await self._storage.prepare_outbox(peer_id, chunks, reply_to, format_data=formats)
         delivered: list[str] = []
+        confirmed_characters = 0
         pending = [
             (chunk, chunk_format, record, wire.start, wire.end)
             for chunk, chunk_format, record, wire in zip(chunks, formats, outbox, wire_chunks, strict=True)
@@ -401,9 +418,10 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 )
                 message_id = _message_id(response)
                 delivered.append(message_id)
+                confirmed_characters = _chunk_end
                 await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             except asyncio.CancelledError:
-                await self._storage.terminalize_outbox_failure(
+                await self._terminalize_failed_send(
                     record,
                     "delivery_unknown" if dispatched else "failed",
                     "send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
@@ -412,7 +430,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 )
                 raise
             except VkDeliveryUnknownError:
-                await self._storage.terminalize_outbox_failure(
+                await self._terminalize_failed_send(
                     record,
                     "delivery_unknown",
                     "request timed out",
@@ -423,7 +441,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     return _partial_result(
                         delivered,
                         [item[0] for item in pending],
-                        delivered_characters=pending[index - 1][4],
+                        delivered_characters=confirmed_characters,
                     )
                 return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
             except VkApiError as exc:
@@ -433,13 +451,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     except OutboxOwnershipLostError:
                         if delivered:
                             return _partial_result(
-                                delivered, [item[0] for item in pending], delivered_characters=pending[index - 1][4]
+                                delivered, [item[0] for item in pending], delivered_characters=confirmed_characters
                             )
                         return _delivery_unknown_result("VK outbox delivery is owned by another sender", record.id)
                     if replacement is None:
                         if delivered:
                             return _partial_result(
-                                delivered, [item[0] for item in pending], delivered_characters=pending[index - 1][4]
+                                delivered, [item[0] for item in pending], delivered_characters=confirmed_characters
                             )
                         return SendResult(
                             success=False,
@@ -459,7 +477,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     ]
                     continue
                 state = "partial_delivery" if delivered else "failed"
-                await self._storage.terminalize_outbox_failure(
+                await self._terminalize_failed_send(
                     record,
                     state,
                     _safe_api_error(exc),
@@ -470,11 +488,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     return _partial_result(
                         delivered,
                         [item[0] for item in pending],
-                        delivered_characters=pending[index - 1][4],
+                        delivered_characters=confirmed_characters,
                     )
                 return _api_error_result(exc)
             except Exception as exc:  # noqa: BLE001
-                await self._storage.terminalize_outbox_failure(
+                await self._terminalize_failed_send(
                     record,
                     "delivery_unknown",
                     type(exc).__name__,
@@ -485,7 +503,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     return _partial_result(
                         delivered,
                         [item[0] for item in pending],
-                        delivered_characters=pending[index - 1][4],
+                        delivered_characters=confirmed_characters,
                     )
                 return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
             index += 1
@@ -514,11 +532,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
                         reply_to=reply_to if not delivered else None,
                         attachment=attachment,
                     )
-                    if not result.success:
+                    delivered.extend(_send_result_ids(result))
+                    if not result.success or _partial_delivery_payload(result) is not None:
                         if delivered:
                             return _partial_result(delivered, [path.name for path in paths])
                         return result
-                    delivered.extend(_send_result_ids(result))
         except Exception as exc:  # noqa: BLE001 - media delivery follows the existing upload contract
             if delivered:
                 return _partial_result(delivered, [table.fallback_text, type(exc).__name__])
@@ -551,6 +569,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             )
         )[0]
         dispatched = False
+        confirmed_id: str | None = None
         try:
             if recoverable:
                 await self._storage.mark_outbox(record.id, "sending")
@@ -568,23 +587,28 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 }
             )
             message_id = _message_id(payload)
+            confirmed_id = message_id
             await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             return SendResult(success=True, message_id=message_id, retryable=False)
         except asyncio.CancelledError:
-            await self._storage.mark_outbox(
-                record.id,
+            await self._terminalize_failed_send(
+                record,
                 "delivery_unknown" if dispatched else "failed",
-                error="send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
+                "send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
+                [],
+                "blocked after cancelled direct send",
             )
             raise
         except VkDeliveryUnknownError:
-            await self._storage.mark_outbox(record.id, "delivery_unknown", error="request timed out")
+            await self._terminalize_failed_send(record, "delivery_unknown", "request timed out", [], "")
             return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
         except VkApiError as exc:
-            await self._storage.mark_outbox(record.id, "failed", error=_safe_api_error(exc))
+            await self._terminalize_failed_send(record, "failed", _safe_api_error(exc), [], "")
             return _api_error_result(exc)
         except Exception as exc:  # noqa: BLE001 - the request may already have reached VK
-            await self._storage.mark_outbox(record.id, "delivery_unknown", error=type(exc).__name__)
+            await self._terminalize_failed_send(record, "delivery_unknown", type(exc).__name__, [], "")
+            if confirmed_id is not None:
+                return _partial_send_result([confirmed_id], {"failed_segment": "storage", "delivered_chunks": 1})
             return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
 
     async def _rechunk_rejected(self, record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
@@ -611,7 +635,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             # terminalize its fresh chunks or permit whole-message fallback.
             raise
         except asyncio.CancelledError:
-            await self._storage.terminalize_outbox_failure(
+            await self._terminalize_failed_send(
                 record,
                 "failed",
                 "rechunk cancelled after known size refusal",
@@ -620,7 +644,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             )
             raise
         except Exception as exc:  # noqa: BLE001 - preserve the known refusal and terminalize every durable tail
-            await self._storage.terminalize_outbox_failure(
+            await self._terminalize_failed_send(
                 record,
                 "failed",
                 f"rechunk failed: {type(exc).__name__}",
