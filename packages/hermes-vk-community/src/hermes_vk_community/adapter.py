@@ -86,6 +86,7 @@ MIN_MESSAGE_LIMIT = 256
 MAX_APPROVAL_PREVIEW = 800
 MAX_PAIRING_TEXT = 128
 MAX_GEO_COORDINATES_LENGTH = 128
+CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +381,26 @@ class VkCommunityAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[vk] failed to persist send diagnostics: %s", type(exc).__name__, exc_info=True)
 
+    async def _terminalize_cancelled_send(
+        self, record: OutboxRecord, state: str, error: str, tail_records: list[OutboxRecord], tail_error: str
+    ) -> None:
+        async def settle() -> None:
+            try:
+                async with asyncio.timeout(CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS):
+                    await self._terminalize_failed_send(record, state, error, tail_records, tail_error)
+            except TimeoutError:
+                logger.warning("[vk] cancellation terminalization timed out; remaining outbox rows may be recoverable")
+
+        cleanup = asyncio.create_task(settle())
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Shutdown may cancel again while cleanup waits for another
+                # local writer. The child retains its own bounded deadline.
+                continue
+        cleanup.result()
+
     async def _send_text_segment(  # noqa: C901, PLR0911, PLR0912 - explicit durable failure/cancellation/ownership states
         self,
         peer_id: int,
@@ -421,7 +442,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 confirmed_characters = _chunk_end
                 await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             except asyncio.CancelledError:
-                await self._terminalize_failed_send(
+                await self._terminalize_cancelled_send(
                     record,
                     "delivery_unknown" if dispatched else "failed",
                     "send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
@@ -591,7 +612,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             return SendResult(success=True, message_id=message_id, retryable=False)
         except asyncio.CancelledError:
-            await self._terminalize_failed_send(
+            await self._terminalize_cancelled_send(
                 record,
                 "delivery_unknown" if dispatched else "failed",
                 "send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
@@ -635,7 +656,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             # terminalize its fresh chunks or permit whole-message fallback.
             raise
         except asyncio.CancelledError:
-            await self._terminalize_failed_send(
+            await self._terminalize_cancelled_send(
                 record,
                 "failed",
                 "rechunk cancelled after known size refusal",
@@ -693,7 +714,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 )
                 await self._storage.mark_outbox(record.id, "sent", message_id=_message_id(response))
             except asyncio.CancelledError:
-                await self._storage.terminalize_outbox_failure(
+                await self._terminalize_cancelled_send(
                     record,
                     "delivery_unknown" if dispatched else "failed",
                     "recovery cancelled after dispatch" if dispatched else "recovery cancelled before dispatch",

@@ -611,6 +611,95 @@ async def test_confirmed_ids_survive_failed_sqlite_diagnostic_writes(  # noqa: C
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+@pytest.mark.parametrize("contention", ["brief", "persistent"])
+async def test_repeated_cancellation_settles_outbox_across_a_local_writer_lock(  # noqa: C901, PLR0915 - real transaction/shutdown interleavings
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, lane: str, contention: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    writer_started, release_writer, cleanup_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    writers: list[asyncio.Task[None]] = []
+    calls: list[dict[str, object]] = []
+    original_prepare, original_prepared = storage.prepare_outbox, storage.prepared_outbox
+    original_terminalize = adapter._terminalize_failed_send
+
+    async def concurrent_writer() -> None:
+        async with storage._transaction() as db:
+            await db.execute("INSERT INTO paired_users(user_id,paired_at_ms) VALUES(123,0)")
+            writer_started.set()
+            await release_writer.wait()
+
+    async def contend_after_read(records: list[OutboxRecord]) -> list[OutboxRecord]:
+        if not writers:
+            writers.append(asyncio.create_task(concurrent_writer()))
+            await writer_started.wait()
+        return records
+
+    async def prepare_then_contend(*args: Any, **kwargs: Any) -> list[OutboxRecord]:  # noqa: ANN401 - storage contract
+        return await contend_after_read(await original_prepare(*args, **kwargs))
+
+    async def prepared_then_contend() -> list[OutboxRecord]:
+        return await contend_after_read(await original_prepared())
+
+    async def terminalize(
+        record: OutboxRecord, state: str, error: str, tail_records: list[OutboxRecord], tail_error: str
+    ) -> None:
+        cleanup_started.set()
+        await original_terminalize(record, state, error, tail_records, tail_error)
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    adapter._send_chunk = transport
+    monkeypatch.setattr(adapter, "_terminalize_failed_send", terminalize)
+    if contention == "persistent":
+        monkeypatch.setattr("hermes_vk_community.adapter.CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    if lane == "recovery":
+        await storage.prepare_outbox(456, ["head", "tail 1", "tail 2"], None)
+        monkeypatch.setattr(storage, "prepared_outbox", prepared_then_contend)
+        operation = adapter._recover_prepared_outbox()
+    else:
+        monkeypatch.setattr(storage, "prepare_outbox", prepare_then_contend)
+        operation = adapter.send("456", "x" * 600)
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(writer_started.wait(), 1)
+        await asyncio.sleep(0)  # records returned; sending now waits for the writer's lock
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        if contention == "brief":
+            release_writer.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert calls == []
+        release_writer.set()
+        await asyncio.gather(*writers)
+        if contention == "persistent":
+            assert "cancellation terminalization timed out" in caplog.text
+            assert len(await storage.prepared_outbox()) == 3
+        else:
+            assert len(await storage.diagnostic_rows(outbox_state="failed")) == 3
+            await storage.close()
+            await storage.open()
+            await adapter._recover_prepared_outbox()
+            assert calls == []
+    finally:
+        release_writer.set()
+        task.cancel()
+        await asyncio.gather(task, *writers, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["send", "direct", "recovery"])
 async def test_cancellation_before_dispatch_is_not_delivery_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
