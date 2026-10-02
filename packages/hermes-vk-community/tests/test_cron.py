@@ -143,6 +143,35 @@ async def test_live_cron_delivery_enforces_private_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_live_router_rejects_vk_thread_target_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    instance = build_adapter(config)
+
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("thread target must be rejected before transport")
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", forbidden)
+    platform = Platform("vk")
+    router = DeliveryRouter(GatewayConfig(platforms={platform: config}), adapters={platform: instance})
+    with pytest.raises(RuntimeError, match="do not support threads"):
+        await router._deliver_to_platform(DeliveryTarget.parse("vk:456:123"), "Отчёт", {"job_id": "test"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send_image", "send_image_file", "send_document", "send_voice"])
+async def test_live_media_rejects_thread_routing_before_io(tmp_path: Path, method: str) -> None:
+    instance = build_adapter(_config(tmp_path))
+    sender = getattr(instance, method)
+    result = await sender("456", "unused-media-path", metadata={"thread_id": "123"})
+    assert not result.success
+    assert result.error == "VK private messages do not support threads"
+
+
+@pytest.mark.asyncio
 async def test_pairing_confirmation_replies_media_and_approval_keep_working(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -320,6 +349,62 @@ async def test_standalone_cancellation_closes_resources(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("kind", "failed_tail"), [("text", 2), ("document", 0)])
+async def test_cancelled_standalone_cannot_recover_an_orphan_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_client: list[str],
+    kind: str,
+    failed_tail: int,
+) -> None:
+    config = _config(tmp_path)
+    config.extra["max_message_length"] = 256
+    started = asyncio.Event()
+
+    async def interrupted(_self: VkCommunityAdapter, _params: dict[str, object]) -> object:
+        started.set()
+        await asyncio.Future()
+
+    async def upload(*_args: object, **_kwargs: object) -> str:
+        return "doc123_42"
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", interrupted)
+    monkeypatch.setattr(VkCommunityAdapter, "_upload_document", upload)
+    report = tmp_path / "report.txt"
+    report.write_text("report", encoding="utf-8")
+    task = asyncio.create_task(
+        send_standalone(config, "456", "x" * 600)
+        if kind == "text"
+        else send_standalone(config, "456", "", media_files=[(str(report), False)])
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert delivery_client[-1] == "closed"
+
+    recovered: list[dict[str, object]] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        recovered.append(params)
+        return 42
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    instance = build_adapter(config)
+    instance._client = cast("Any", object())
+    instance._storage = VkStorage(tmp_path / "state.sqlite3")
+    await instance._storage.open()
+    try:
+        assert len(await instance._storage.diagnostic_rows(outbox_state="delivery_unknown")) == 1
+        assert len(await instance._storage.diagnostic_rows(outbox_state="failed")) == failed_tail
+        assert await instance._storage.prepared_outbox() == []
+        await instance._recover_prepared_outbox()
+        assert recovered == []
+    finally:
+        await instance._storage.close()
+
+
+@pytest.mark.asyncio
 async def test_standalone_does_not_report_partial_delivery_as_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -331,6 +416,46 @@ async def test_standalone_does_not_report_partial_delivery_as_success(
     monkeypatch.setattr(VkCommunityAdapter, "send", partial)
     assert "error" in await send_standalone(_config(tmp_path), "456", "Отчёт")
     assert delivery_client[-1] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_outbox_recovery_terminalizes_its_remaining_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = build_adapter(_config(tmp_path))
+    instance._client = cast("Any", object())
+    instance._storage = VkStorage(tmp_path / "state.sqlite3")
+    await instance._storage.open()
+    started = asyncio.Event()
+    calls: list[dict[str, object]] = []
+
+    async def interrupted(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        calls.append(params)
+        started.set()
+        await asyncio.Future()
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", interrupted)
+    try:
+        await instance._storage.prepare_outbox(456, ["head", "tail 1", "tail 2"], None)
+        task = asyncio.create_task(instance._recover_prepared_outbox())
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await instance._storage.close()
+        await instance._storage.open()
+        assert len(await instance._storage.diagnostic_rows(outbox_state="delivery_unknown")) == 1
+        assert len(await instance._storage.diagnostic_rows(outbox_state="failed")) == 2
+        monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+        await instance._recover_prepared_outbox()
+        assert len(calls) == 1
+    finally:
+        await instance._storage.close()
 
 
 @pytest.mark.asyncio

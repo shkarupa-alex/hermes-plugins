@@ -73,6 +73,12 @@ HTTP_SERVER_ERROR_MIN = 500
 INTERACTION_TTL_SECONDS = 600
 VK_TOO_LONG_ERROR = 914
 VK_CHAT_PEER_MIN = 2_000_000_000
+THREAD_ROUTING_KEYS = (
+    "thread_id",
+    "message_thread_id",
+    "direct_messages_topic_id",
+    "telegram_direct_messages_topic_id",
+)
 MIN_MESSAGE_LIMIT = 256
 MAX_APPROVAL_PREVIEW = 800
 MAX_PAIRING_TEXT = 128
@@ -175,9 +181,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
         await self._stop_polling()
         await self._close_resources(release_lock=True)
 
-    async def _delivery_target_error(self, chat_id: str) -> SendResult | None:
+    async def _delivery_target_error(self, chat_id: str, metadata: dict[str, Any] | None = None) -> SendResult | None:
         # Cron can bypass send_once through a live gateway adapter. Apply the
         # same static/pairing policy as inbound messages, before content I/O.
+        if any((metadata or {}).get(key) for key in THREAD_ROUTING_KEYS):
+            return SendResult(success=False, error="VK private messages do not support threads", retryable=False)
         user_id = _private_delivery_user_id(chat_id)
         if user_id is not None:
             if chat_id in self._allow_from:
@@ -266,8 +274,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
-        del metadata
-        if denied := await self._delivery_target_error(chat_id):
+        if denied := await self._delivery_target_error(chat_id, metadata):
             return denied
         if self._client is None or self._storage is None:
             return SendResult(
@@ -324,7 +331,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             chat_id, content, reply_to=reply_to, metadata=metadata, max_retries=max_retries, base_delay=base_delay
         )
 
-    async def _send_text_segment(  # noqa: PLR0911 - durable chunk delivery has explicit terminal states
+    async def _send_text_segment(  # noqa: C901, PLR0911 - durable delivery has explicit failure/cancellation states
         self,
         peer_id: int,
         rendered: RenderedTextSegment,
@@ -344,8 +351,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         index = 0
         while index < len(pending):
             chunk, chunk_format, record, chunk_start, _chunk_end = pending[index]
-            await self._storage.mark_outbox(record.id, "sending")
             try:
+                await self._storage.mark_outbox(record.id, "sending")
                 response = await self._send_chunk(
                     {
                         "peer_id": peer_id,
@@ -360,6 +367,15 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 message_id = _message_id(response)
                 delivered.append(message_id)
                 await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
+            except asyncio.CancelledError:
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    "delivery_unknown",
+                    "send cancelled after dispatch",
+                    [item[2] for item in pending[index + 1 :]],
+                    "blocked after cancelled earlier chunk",
+                )
+                raise
             except VkDeliveryUnknownError:
                 await self._storage.terminalize_outbox_failure(
                     record,
@@ -497,9 +513,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 recoverable=recoverable,
             )
         )[0]
-        if recoverable:
-            await self._storage.mark_outbox(record.id, "sending")
         try:
+            if recoverable:
+                await self._storage.mark_outbox(record.id, "sending")
             payload = await self._send_chunk(
                 {
                     "peer_id": peer_id,
@@ -515,6 +531,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
             message_id = _message_id(payload)
             await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             return SendResult(success=True, message_id=message_id, retryable=False)
+        except asyncio.CancelledError:
+            await self._storage.mark_outbox(record.id, "delivery_unknown", error="send cancelled after dispatch")
+            raise
         except VkDeliveryUnknownError:
             await self._storage.mark_outbox(record.id, "delivery_unknown", error="request timed out")
             return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
@@ -533,8 +552,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         for record_index, record in enumerate(records):
             if record.invocation_id in blocked_invocations:
                 continue
-            await self._storage.mark_outbox(record.id, "sending")
             try:
+                await self._storage.mark_outbox(record.id, "sending")
                 response = await self._send_chunk(
                     {
                         "peer_id": record.peer_id,
@@ -547,6 +566,15 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     }
                 )
                 await self._storage.mark_outbox(record.id, "sent", message_id=_message_id(response))
+            except asyncio.CancelledError:
+                await self._storage.terminalize_outbox_failure(
+                    record,
+                    "delivery_unknown",
+                    "recovery cancelled after dispatch",
+                    [item for item in records[record_index + 1 :] if item.invocation_id == record.invocation_id],
+                    "blocked after cancelled recovery chunk",
+                )
+                raise
             except VkDeliveryUnknownError:
                 await self._storage.terminalize_outbox_failure(
                     record,
@@ -766,7 +794,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: dict[str, Any] | None,
     ) -> SendResult:
-        if denied := await self._delivery_target_error(chat_id):
+        if denied := await self._delivery_target_error(chat_id, metadata):
             return denied
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -813,7 +841,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
-        if denied := await self._delivery_target_error(chat_id):
+        if denied := await self._delivery_target_error(chat_id, metadata):
             return denied
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
@@ -836,8 +864,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,  # noqa: ANN401 - exact Hermes compatibility contract
     ) -> SendResult:
-        del metadata, kwargs
-        if denied := await self._delivery_target_error(chat_id):
+        del kwargs
+        if denied := await self._delivery_target_error(chat_id, metadata):
             return denied
         try:
             attachment = await self._upload_photo(int(chat_id), Path(image_path))
@@ -855,8 +883,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,  # noqa: ANN401 - exact Hermes compatibility contract
     ) -> SendResult:
-        del metadata, kwargs
-        if denied := await self._delivery_target_error(chat_id):
+        del kwargs
+        if denied := await self._delivery_target_error(chat_id, metadata):
             return denied
         try:
             attachment = await self._upload_document(int(chat_id), Path(file_path), file_name=file_name)
@@ -873,8 +901,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,  # noqa: ANN401 - exact Hermes compatibility contract
     ) -> SendResult:
-        del metadata, kwargs
-        if denied := await self._delivery_target_error(chat_id):
+        del kwargs
+        if denied := await self._delivery_target_error(chat_id, metadata):
             return denied
         source = Path(audio_path)
         try:
