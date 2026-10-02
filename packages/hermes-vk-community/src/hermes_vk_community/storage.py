@@ -1,15 +1,18 @@
 from __future__ import annotations
+import asyncio
 import hashlib
 import json
 import secrets
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 import aiosqlite
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
     from hermes_vk_community.models import JsonObject
@@ -124,6 +127,7 @@ class VkStorage:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._db: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
 
     async def open(self, *, recover_inflight: bool = True) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -215,27 +219,42 @@ class VkStorage:
             raise RuntimeError(f"VK storage schema is incomplete; missing: {', '.join(sorted(missing))}")
 
     async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-        self._db = None
+        async with self._lock:
+            if self._db is not None:
+                await self._db.close()
+            self._db = None
 
     def _connection(self) -> aiosqlite.Connection:
         if self._db is None:
             raise RuntimeError("storage is not open")
         return self._db
 
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
+        # aiosqlite queues statements, not whole coroutine transactions. Every
+        # writer owns the connection until commit/rollback; readers use the same
+        # lock so they cannot act on another coroutine's uncommitted records.
+        async with self._lock:
+            db = self._connection()
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                yield db
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
     async def cursor(self, group_id: int) -> str | None:
-        db = self._connection()
-        async with db.execute("SELECT ts FROM long_poll_cursor WHERE group_id=?", (group_id,)) as cursor:
-            row = await cursor.fetchone()
-        return str(row[0]) if row else None
+        async with self._lock:
+            db = self._connection()
+            async with db.execute("SELECT ts FROM long_poll_cursor WHERE group_id=?", (group_id,)) as cursor:
+                row = await cursor.fetchone()
+            return str(row[0]) if row else None
 
     async def admit_batch(self, group_id: int, updates: list[JsonObject], ts: str) -> list[int]:
-        db = self._connection()
         now = _now_ms()
         inserted: list[int] = []
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
             for update in updates:
                 stable_update = normalize_update(update)
                 normalized = canonical_json(stable_update)
@@ -280,25 +299,21 @@ class VkStorage:
                 ON CONFLICT(group_id) DO UPDATE SET ts=excluded.ts,updated_at_ms=excluded.updated_at_ms""",
                 (group_id, ts, now),
             )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
         return inserted
 
     async def received(self) -> list[InboxRecord]:
-        db = self._connection()
-        async with db.execute("SELECT id,normalized_json FROM inbox WHERE state='received' ORDER BY id") as cursor:
-            rows = await cursor.fetchall()
-        return [InboxRecord(id=int(row[0]), normalized_json=str(row[1])) for row in rows]
+        async with self._lock:
+            db = self._connection()
+            async with db.execute("SELECT id,normalized_json FROM inbox WHERE state='received' ORDER BY id") as cursor:
+                rows = await cursor.fetchall()
+            return [InboxRecord(id=int(row[0]), normalized_json=str(row[1])) for row in rows]
 
     async def mark_inbox(self, row_id: int, state: InboxState, error: str | None = None) -> None:
-        db = self._connection()
-        await db.execute(
-            "UPDATE inbox SET state=?,attempts=attempts+1,error=?,updated_at_ms=? WHERE id=?",
-            (state, (error or "")[:2048] or None, _now_ms(), row_id),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                "UPDATE inbox SET state=?,attempts=attempts+1,error=?,updated_at_ms=? WHERE id=?",
+                (state, (error or "")[:2048] or None, _now_ms(), row_id),
+            )
 
     async def prepare_outbox(
         self,
@@ -309,15 +324,13 @@ class VkStorage:
         recoverable: bool = True,
         format_data: list[dict[str, object] | None] | None = None,
     ) -> list[OutboxRecord]:
-        db = self._connection()
         invocation_id = uuid.uuid4().hex
         now = _now_ms()
         records: list[OutboxRecord] = []
         formats = format_data or [None] * len(chunks)
         if len(formats) != len(chunks):
             raise ValueError("format_data must align with chunks")
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
             for index, (chunk, chunk_format) in enumerate(zip(chunks, formats, strict=True)):
                 format_json = canonical_json(chunk_format) if chunk_format else None
                 while True:
@@ -354,57 +367,51 @@ class VkStorage:
                             )
                         )
                         break
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
         return records
 
     async def prepared_outbox(self) -> list[OutboxRecord]:
-        db = self._connection()
-        # Another process can still own an in-flight prefix. Recover its tail
-        # only after that prefix is confirmed, or replay the prepared prefix
-        # first using its persisted random_id.
-        async with db.execute(
-            "SELECT pending.id,pending.invocation_id,pending.peer_id,pending.chunk_index,pending.random_id,"
-            "pending.wire_content,pending.reply_target,pending.format_data_json "
-            "FROM outbox AS pending WHERE pending.state='prepared' AND pending.wire_content IS NOT NULL "
-            "AND NOT EXISTS (SELECT 1 FROM outbox AS earlier "
-            "WHERE earlier.invocation_id=pending.invocation_id AND earlier.chunk_index<pending.chunk_index "
-            "AND (earlier.state NOT IN ('prepared','sent') "
-            "OR (earlier.state='prepared' AND earlier.wire_content IS NULL))) ORDER BY pending.id"
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [
-            OutboxRecord(
-                id=int(row[0]),
-                invocation_id=str(row[1]),
-                peer_id=int(row[2]),
-                chunk_index=int(row[3]),
-                random_id=int(row[4]),
-                wire_content=str(row[5]),
-                reply_target=str(row[6]) if row[6] is not None else None,
-                format_data=cast("dict[str, object]", json.loads(str(row[7]))) if row[7] is not None else None,
-            )
-            for row in rows
-        ]
+        async with self._lock:
+            db = self._connection()
+            # Another process can still own an in-flight prefix. Recover its tail
+            # only after that prefix is confirmed, or replay the prepared prefix
+            # first using its persisted random_id.
+            async with db.execute(
+                "SELECT pending.id,pending.invocation_id,pending.peer_id,pending.chunk_index,pending.random_id,"
+                "pending.wire_content,pending.reply_target,pending.format_data_json "
+                "FROM outbox AS pending WHERE pending.state='prepared' AND pending.wire_content IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM outbox AS earlier "
+                "WHERE earlier.invocation_id=pending.invocation_id AND earlier.chunk_index<pending.chunk_index "
+                "AND (earlier.state NOT IN ('prepared','sent') "
+                "OR (earlier.state='prepared' AND earlier.wire_content IS NULL))) ORDER BY pending.id"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return [
+                OutboxRecord(
+                    id=int(row[0]),
+                    invocation_id=str(row[1]),
+                    peer_id=int(row[2]),
+                    chunk_index=int(row[3]),
+                    random_id=int(row[4]),
+                    wire_content=str(row[5]),
+                    reply_target=str(row[6]) if row[6] is not None else None,
+                    format_data=cast("dict[str, object]", json.loads(str(row[7]))) if row[7] is not None else None,
+                )
+                for row in rows
+            ]
 
     async def create_pairing_code(self, code: str, ttl_seconds: int) -> None:
-        db = self._connection()
-        now = _now_ms()
-        digest = hashlib.sha256(code.strip().encode()).hexdigest()
-        await db.execute(
-            "INSERT INTO pairing_codes(code_sha256,expires_at_ms,created_at_ms) VALUES(?,?,?)",
-            (digest, now + ttl_seconds * 1000, now),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            now = _now_ms()
+            digest = hashlib.sha256(code.strip().encode()).hexdigest()
+            await db.execute(
+                "INSERT INTO pairing_codes(code_sha256,expires_at_ms,created_at_ms) VALUES(?,?,?)",
+                (digest, now + ttl_seconds * 1000, now),
+            )
 
     async def consume_pairing_code(self, code: str, user_id: int) -> bool:
-        db = self._connection()
         now = _now_ms()
         digest = hashlib.sha256(code.strip().encode()).hexdigest()
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
             cursor = await db.execute(
                 "UPDATE pairing_codes SET consumed_at_ms=?,consumed_by_user_id=? "
                 "WHERE code_sha256=? AND consumed_at_ms IS NULL AND expires_at_ms>=?",
@@ -415,36 +422,31 @@ class VkStorage:
                 await db.execute(
                     "INSERT OR REPLACE INTO paired_users(user_id,paired_at_ms) VALUES(?,?)", (user_id, now)
                 )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
         return consumed
 
     async def is_paired(self, user_id: int) -> bool:
-        db = self._connection()
-        async with db.execute("SELECT 1 FROM paired_users WHERE user_id=?", (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
+        async with self._lock:
+            db = self._connection()
+            async with db.execute("SELECT 1 FROM paired_users WHERE user_id=?", (user_id,)) as cursor:
+                return await cursor.fetchone() is not None
 
     async def record_media_orphan(self, kind: str, peer_id: int, upload_fingerprint: str, error: str) -> None:
-        db = self._connection()
-        await db.execute(
-            "INSERT INTO media_orphans(kind,peer_id,upload_sha256,error,created_at_ms) VALUES(?,?,?,?,?)",
-            (kind[:32], peer_id, upload_fingerprint[:64], error[:2048], _now_ms()),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                "INSERT INTO media_orphans(kind,peer_id,upload_sha256,error,created_at_ms) VALUES(?,?,?,?,?)",
+                (kind[:32], peer_id, upload_fingerprint[:64], error[:2048], _now_ms()),
+            )
 
     async def mark_outbox(
         self, row_id: int, state: str, *, message_id: str | None = None, error: str | None = None
     ) -> None:
-        db = self._connection()
-        await db.execute(
-            """UPDATE outbox SET state=?,attempt_count=attempt_count+CASE WHEN ?='sending' THEN 1 ELSE 0 END,
-            returned_message_id=?,error=?,updated_at_ms=?
-            WHERE id=?""",
-            (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
-        )
-        await db.commit()
+        async with self._transaction() as db:
+            await db.execute(
+                """UPDATE outbox SET state=?,attempt_count=attempt_count+CASE WHEN ?='sending' THEN 1 ELSE 0 END,
+                returned_message_id=?,error=?,updated_at_ms=?
+                WHERE id=?""",
+                (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
+            )
 
     async def terminalize_outbox_failure(
         self,
@@ -455,10 +457,8 @@ class VkStorage:
         tail_error: str,
     ) -> None:
         """Atomically terminate a failed chunk and every later prepared chunk."""
-        db = self._connection()
         now = _now_ms()
-        await db.execute("BEGIN IMMEDIATE")
-        try:
+        async with self._transaction() as db:
             await db.execute(
                 "UPDATE outbox SET state=?,error=?,updated_at_ms=? WHERE id=?",
                 (state, (error or "delivery failed")[:2048], now, record.id),
@@ -474,66 +474,65 @@ class VkStorage:
                         *(item.id for item in tail_records),
                     ),
                 )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
 
     async def counts(self) -> dict[str, int]:
-        db = self._connection()
-        result: dict[str, int] = {}
-        for table, state in (("inbox", "dispatched"), ("outbox", "delivery_unknown")):
-            async with db.execute(f"SELECT count(*) FROM {table} WHERE state=?", (state,)) as cursor:  # noqa: S608
+        async with self._lock:
+            db = self._connection()
+            result: dict[str, int] = {}
+            for table, state in (("inbox", "dispatched"), ("outbox", "delivery_unknown")):
+                async with db.execute(f"SELECT count(*) FROM {table} WHERE state=?", (state,)) as cursor:  # noqa: S608
+                    row = await cursor.fetchone()
+                result[f"{table}_{state}"] = int(row[0]) if row else 0
+            async with db.execute("SELECT count(*) FROM media_orphans") as cursor:
                 row = await cursor.fetchone()
-            result[f"{table}_{state}"] = int(row[0]) if row else 0
-        async with db.execute("SELECT count(*) FROM media_orphans") as cursor:
-            row = await cursor.fetchone()
-        result["media_orphans"] = int(row[0]) if row else 0
-        return result
+            result["media_orphans"] = int(row[0]) if row else 0
+            return result
 
     async def diagnostic_rows(
         self, *, inbox_state: str | None = None, outbox_state: str | None = None
     ) -> list[dict[str, object]]:
-        db = self._connection()
-        result: list[dict[str, object]] = []
-        if inbox_state is not None:
-            async with db.execute(
-                "SELECT id,group_id,event_id,peer_id,attempts,error,updated_at_ms FROM inbox WHERE state=? ORDER BY id",
-                (inbox_state,),
-            ) as cursor:
-                result.extend(
-                    {
-                        "kind": "inbox",
-                        "id": int(row[0]),
-                        "group_id": int(row[1]),
-                        "event_id": row[2],
-                        "peer_id": row[3],
-                        "attempts": int(row[4]),
-                        "error": row[5],
-                        "updated_at_ms": int(row[6]),
-                    }
-                    for row in await cursor.fetchall()
-                )
-        if outbox_state is not None:
-            async with db.execute(
-                "SELECT id,invocation_id,peer_id,chunk_index,attempt_count,error,updated_at_ms "
-                "FROM outbox WHERE state=? ORDER BY id",
-                (outbox_state,),
-            ) as cursor:
-                result.extend(
-                    {
-                        "kind": "outbox",
-                        "id": int(row[0]),
-                        "invocation_id": str(row[1]),
-                        "peer_id": int(row[2]),
-                        "chunk_index": int(row[3]),
-                        "attempt_count": int(row[4]),
-                        "error": row[5],
-                        "updated_at_ms": int(row[6]),
-                    }
-                    for row in await cursor.fetchall()
-                )
-        return result
+        async with self._lock:
+            db = self._connection()
+            result: list[dict[str, object]] = []
+            if inbox_state is not None:
+                async with db.execute(
+                    "SELECT id,group_id,event_id,peer_id,attempts,error,updated_at_ms "
+                    "FROM inbox WHERE state=? ORDER BY id",
+                    (inbox_state,),
+                ) as cursor:
+                    result.extend(
+                        {
+                            "kind": "inbox",
+                            "id": int(row[0]),
+                            "group_id": int(row[1]),
+                            "event_id": row[2],
+                            "peer_id": row[3],
+                            "attempts": int(row[4]),
+                            "error": row[5],
+                            "updated_at_ms": int(row[6]),
+                        }
+                        for row in await cursor.fetchall()
+                    )
+            if outbox_state is not None:
+                async with db.execute(
+                    "SELECT id,invocation_id,peer_id,chunk_index,attempt_count,error,updated_at_ms "
+                    "FROM outbox WHERE state=? ORDER BY id",
+                    (outbox_state,),
+                ) as cursor:
+                    result.extend(
+                        {
+                            "kind": "outbox",
+                            "id": int(row[0]),
+                            "invocation_id": str(row[1]),
+                            "peer_id": int(row[2]),
+                            "chunk_index": int(row[3]),
+                            "attempt_count": int(row[4]),
+                            "error": row[5],
+                            "updated_at_ms": int(row[6]),
+                        }
+                        for row in await cursor.fetchall()
+                    )
+            return result
 
 
 def _now_ms() -> int:

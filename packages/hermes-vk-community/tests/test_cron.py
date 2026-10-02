@@ -514,6 +514,44 @@ async def test_gateway_recovery_cannot_take_an_active_standalone_tail(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["native", "live_cron"])
+async def test_concurrent_chat_reply_and_report_share_storage_safely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    if lane == "live_cron" and not supports_cron_delivery():
+        pytest.skip("old-host VK cron is unsupported")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    instance = build_adapter(config)
+    calls: list[str] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        calls.append(str(params["message"]))
+        return len(calls)
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    instance._client = cast("Any", object())
+    instance._storage = VkStorage(tmp_path / "state.sqlite3")
+    await instance._storage.open()
+    try:
+        if lane == "live_cron":
+            platform = Platform("vk")
+            router = DeliveryRouter(GatewayConfig(platforms={platform: config}), adapters={platform: instance})
+            target = DeliveryTarget(platform=platform, chat_id="456", is_explicit=True)
+            report = router._deliver_to_platform(target, "scheduled report", {"job_id": "test"})
+        else:
+            report = instance.send("456", "scheduled report")
+        results = await asyncio.gather(report, instance._send_with_retry("456", "ordinary chat reply"))
+        for result in results:
+            assert isinstance(result, SendResult)
+            assert result.success
+        assert sorted(calls) == ["ordinary chat reply", "scheduled report"]
+        assert len(await instance._storage.diagnostic_rows(outbox_state="sent")) == 2
+    finally:
+        await instance._storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["native", "live_router", "gateway_retry"])
 async def test_partial_report_is_a_failure_without_duplicate_head(
     tmp_path: Path,

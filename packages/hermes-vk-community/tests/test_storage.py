@@ -1,5 +1,6 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
+import asyncio
 import json
 from typing import TYPE_CHECKING
 
@@ -77,6 +78,59 @@ async def test_recovery_requires_a_recoverable_or_confirmed_prefix(tmp_path: Pat
         expected = [*chunks[1:], unrelated] if prefix_state == "sent" else [unrelated]
         assert [row.id for row in recovered] == [row.id for row in expected]
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_inbox_outbox_and_pairing_writes_are_independent(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    update: JsonObject = {"type": "message_new", "event_id": "concurrent", "group_id": 1}
+    try:
+        results = await asyncio.gather(
+            *(storage.prepare_outbox(2, [f"report {i}"], None) for i in range(10)),
+            storage.admit_batch(1, [update], "42"),
+            storage.create_pairing_code("PAIR", 60),
+        )
+        assert len(await storage.prepared_outbox()) == 10
+        assert len(await storage.received()) == 1
+        assert await storage.cursor(1) == "42"
+        assert await storage.consume_pairing_code("PAIR", 123)
+        assert len(results) == 12
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transaction_cannot_commit_or_rollback_another_writer(tmp_path: Path) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    started = asyncio.Event()
+
+    async def interrupted_writer() -> None:
+        async with storage._transaction() as db:
+            await db.execute("INSERT INTO paired_users(user_id,paired_at_ms) VALUES(123,0)")
+            started.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(interrupted_writer())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        reader = asyncio.create_task(storage.is_paired(123))
+        other_writer = asyncio.create_task(storage.create_pairing_code("SAFE", 60))
+        await asyncio.sleep(0)
+        assert not reader.done()
+        assert not other_writer.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not await reader
+        await other_writer
+        assert await storage.consume_pairing_code("SAFE", 456)
+        assert await storage.is_paired(456)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await storage.close()
 
 
