@@ -138,6 +138,112 @@ async def test_live_cron_delivery_enforces_private_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_pairing_confirmation_replies_media_and_approval_keep_working(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.extra["pairing"] = {"enabled": True}
+    instance = build_adapter(config)
+    sent: list[dict[str, object]] = []
+    replies: list[SendResult] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        sent.append(params)
+        return len(sent)
+
+    async def handle(self: VkCommunityAdapter, _event: object) -> None:
+        replies.append(await self.send("789", "Ответ"))
+
+    async def upload(*_args: object, **_kwargs: object) -> str:
+        return "doc123_42"
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr(VkCommunityAdapter, "handle_message", handle)
+    monkeypatch.setattr(VkCommunityAdapter, "_upload_document", upload)
+    instance._client = cast("Any", object())
+    instance._storage = VkStorage(tmp_path / "state.sqlite3")
+    await instance._storage.open()
+    try:
+        await instance._storage.create_pairing_code("pair-code", 600)
+        for message_id, text in enumerate(("pair-code", "Привет"), start=1):
+            await instance._storage.admit_batch(
+                123,
+                [
+                    {
+                        "type": "message_new",
+                        "group_id": 123,
+                        "event_id": f"pair-{message_id}",
+                        "object": {
+                            "message": {
+                                "id": message_id,
+                                "date": 1,
+                                "peer_id": 789,
+                                "from_id": 789,
+                                "text": text,
+                            }
+                        },
+                    }
+                ],
+                str(message_id),
+            )
+        await instance._dispatch_received()
+        assert await instance._storage.is_paired(789)
+        assert "Устройство привязано" in str(sent[0]["message"])
+        assert len(replies) == 1
+        assert replies[0].success
+        assert (await instance.send_document("789", "report.csv")).success
+        assert (await instance.send_exec_approval("789", "command", "session")).success
+        assert all(item["peer_id"] == 789 for item in sent)
+        count = len(sent)
+        assert not (await instance.send("999", "Отчёт")).success
+        assert len(sent) == count
+    finally:
+        await instance._storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "paired", "chat_id", "allowed"),
+    [
+        (True, True, "789", True),
+        (True, False, "789", False),
+        (False, True, "789", False),
+        (True, True, "2000000001", False),
+    ],
+)
+async def test_standalone_uses_only_active_private_pairing_grants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_client: list[str],
+    enabled: bool,  # noqa: FBT001 - authorization fixture
+    paired: bool,  # noqa: FBT001 - authorization fixture
+    chat_id: str,
+    allowed: bool,  # noqa: FBT001 - expected outcome
+) -> None:
+    config = _config(tmp_path)
+    config.extra["pairing"] = {"enabled": enabled}
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    try:
+        if paired:
+            await storage.create_pairing_code("pair-code", 600)
+            assert await storage.consume_pairing_code("pair-code", int(chat_id))
+    finally:
+        await storage.close()
+
+    async def send(_self: VkCommunityAdapter, _chat_id: str, _content: str) -> SendResult:
+        return SendResult(success=True, message_id="42")
+
+    monkeypatch.setattr(VkCommunityAdapter, "send", send)
+    result = await send_standalone(config, chat_id, "Отчёт")
+    assert bool(result.get("success")) == allowed
+    assert bool(delivery_client) == allowed
+    if allowed:
+        assert delivery_client[-1] == "closed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chat_id", ["999", "2000000001"])
 @pytest.mark.parametrize("method", ["send_image", "send_image_file", "send_document", "send_voice"])
 async def test_live_media_rejects_non_allowlisted_target_before_io(
