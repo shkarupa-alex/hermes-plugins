@@ -54,8 +54,14 @@ def main() -> None:
     if current.stdout.strip() != source["rev"]:
         run("git", "-C", str(HOST), "fetch", "--depth", "1", "--filter=blob:none", "origin", source["rev"])
         run("git", "-C", str(HOST), "checkout", "--detach", source["rev"])
-    selection = ("--package", args.package) if args.package else ("--all-packages",)
-    run("uv", "sync", *selection, "--locked", "--no-install-package", "hermes-agent")
+    common = ("--locked", "--no-install-package", "hermes-agent")
+    if args.package:
+        # --package selects the member's groups, so explicitly install the
+        # root test tools first, then retain them while adding that member.
+        run("uv", "sync", "--only-dev", *common)
+        run("uv", "sync", "--package", args.package, "--inexact", *common)
+    else:
+        run("uv", "sync", "--all-packages", *common)
     run("uv", "pip", "install", "--no-deps", "--editable", str(HOST))
 
 
