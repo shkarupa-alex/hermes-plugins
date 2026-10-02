@@ -13,6 +13,7 @@ from gateway.platforms.base import SendResult
 from hermes_vk_community import adapter as adapter_module
 from hermes_vk_community import plugin as plugin_module
 from hermes_vk_community.adapter import VkCommunityAdapter
+from hermes_vk_community.errors import VkApiError
 from hermes_vk_community.plugin import build_adapter, register, send_standalone
 from hermes_vk_community.storage import VkStorage
 
@@ -325,6 +326,64 @@ async def test_standalone_does_not_report_partial_delivery_as_success(
     monkeypatch.setattr(VkCommunityAdapter, "send", partial)
     assert "error" in await send_standalone(_config(tmp_path), "456", "Отчёт")
     assert delivery_client[-1] == "closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["native", "live_router", "gateway_retry"])
+async def test_partial_report_is_a_failure_without_duplicate_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    instance = build_adapter(config)
+    instance._effective_limit = 256
+    chunks: list[str] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        chunks.append(str(params["message"]))
+        if len(chunks) == 1:
+            return 42
+        raise VkApiError(15, "denied")
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    instance._client = cast("Any", object())
+    instance._storage = VkStorage(tmp_path / "state.sqlite3")
+    await instance._storage.open()
+    try:
+        content = "x" * 600
+        if lane == "live_router":
+            platform = Platform("vk")
+            router = DeliveryRouter(GatewayConfig(platforms={platform: config}), adapters={platform: instance})
+            target = DeliveryTarget(platform=platform, chat_id="456", is_explicit=True)
+            with pytest.raises(RuntimeError, match="partially delivered"):
+                await router._deliver_to_platform(target, content, {"job_id": "test"})
+        else:
+            result = (
+                await instance._send_with_retry("456", content, max_retries=0)
+                if lane == "gateway_retry"
+                else await instance.send("456", content)
+            )
+            assert not result.success
+            assert not result.retryable
+            assert result.message_id == "42"
+            raw = cast("dict[str, Any]", result.raw_response)
+            assert raw["partial_overflow"] is True
+            assert raw["delivered_chunks"] == 1
+            assert raw["partial_delivery"]["total_chunks"] == 3
+            # Current Hermes' cron confirmation must reject the native result.
+            try:
+                delivery = importlib.import_module("cron.scheduler_delivery")
+            except ImportError:
+                delivery = importlib.import_module("cron.scheduler")
+            confirm = getattr(delivery, "_confirm_adapter_delivery", None)
+            if confirm is not None:
+                assert not confirm(result)
+        assert len(chunks) == 2  # no plain-text fallback or whole-report retry
+        assert len(await instance._storage.prepared_outbox()) == 0
+    finally:
+        await instance._storage.close()
 
 
 def test_cron_lists_vk_and_resolves_home_and_explicit_targets(

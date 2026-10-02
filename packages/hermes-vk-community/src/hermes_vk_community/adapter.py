@@ -293,28 +293,34 @@ class VkCommunityAdapter(BasePlatformAdapter):
             delivered.extend(segment_ids)
             partial = _partial_delivery_payload(result)
             if partial is not None:
-                return SendResult(
-                    success=True,
-                    message_id=delivered[-1] if delivered else result.message_id,
-                    continuation_message_ids=tuple(delivered[:-1]),
-                    retryable=False,
-                    raw_response={"partial_delivery": partial},
-                )
+                return _partial_send_failure(delivered, partial)
             if not result.success:
                 if delivered:
-                    return SendResult(
-                        success=True,
-                        message_id=delivered[-1],
-                        continuation_message_ids=tuple(delivered[:-1]),
-                        retryable=False,
-                        raw_response={"partial_delivery": {"failed_segment": type(segment).__name__}},
-                    )
+                    return _partial_send_failure(delivered, {"failed_segment": type(segment).__name__})
                 return result
         return SendResult(
             success=True,
             message_id=delivered[-1] if delivered else None,
             continuation_message_ids=tuple(delivered[:-1]),
             retryable=False,
+        )
+
+    async def _send_with_retry(  # noqa: PLR0913, PLR0917 - exact Hermes delivery contract
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: Any = None,  # noqa: ANN401 - exact Hermes delivery contract
+        max_retries: int = 2,
+        base_delay: float = 2.0,
+    ) -> SendResult:
+        if not hasattr(BasePlatformAdapter, "_is_partial_delivery"):
+            # Older Hermes retries/falls back with the whole message even after
+            # a partial or ambiguous send. VK already retries safe API refusals
+            # per chunk; preserve its durable result without resending the head.
+            return await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        return await super()._send_with_retry(
+            chat_id, content, reply_to=reply_to, metadata=metadata, max_retries=max_retries, base_delay=base_delay
         )
 
     async def _send_text_segment(  # noqa: PLR0911 - durable chunk delivery has explicit terminal states
@@ -1407,6 +1413,22 @@ def _safe_api_error(exc: VkApiError) -> str:
         914: "VK rejected the message because it is too long.",
     }
     return messages.get(exc.code, f"VK rejected the request (error {exc.code}).")
+
+
+def _partial_send_failure(delivered: list[str], partial: dict[str, object]) -> SendResult:
+    return SendResult(
+        success=False,
+        error="VK message was only partially delivered",
+        message_id=delivered[-1],
+        continuation_message_ids=tuple(delivered[:-1]),
+        retryable=False,
+        raw_response={
+            "partial_overflow": True,
+            "partial_delivery": partial,
+            "delivered_chunks": len(delivered),
+            "last_message_id": delivered[-1],
+        },
+    )
 
 
 def _partial_result(
