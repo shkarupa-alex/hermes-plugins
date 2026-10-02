@@ -2,7 +2,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -22,6 +24,12 @@ MAX_NORMALIZED_JSON_LENGTH = 262_144
 SCHEMA_VERSION = 3
 PREVIOUS_SCHEMA_VERSION = 2
 UPDATE_FIELDS = ("type", "object", "group_id", "event_id")
+logger = logging.getLogger(__name__)
+
+
+class OutboxOwnershipLostError(RuntimeError):
+    """Another sender has already replaced this logical outbox chunk."""
+
 
 SCHEMA = """
 CREATE TABLE schema_meta (
@@ -242,18 +250,8 @@ class VkStorage:
                 await db.execute("BEGIN IMMEDIATE")
                 yield db
                 await db.commit()
-            except asyncio.CancelledError:
-
-                async def settle() -> None:
-                    # aiosqlite's worker may have committed before cancellation
-                    # reached the waiter. FIFO rollback settles that outcome;
-                    # preparation still owns its invocation and can retire it.
-                    await db.rollback()
-                    if on_cancel is not None:
-                        await on_cancel(db)
-                        await db.commit()
-
-                cleanup = asyncio.create_task(settle())
+            except asyncio.CancelledError as cancelled:
+                cleanup = asyncio.create_task(self._settle_cancelled_transaction(db, on_cancel))
                 while not cleanup.done():
                     try:
                         await asyncio.shield(cleanup)
@@ -261,11 +259,45 @@ class VkStorage:
                         # Retain the connection lock even if shutdown cancels
                         # this task again while the worker finishes cleanup.
                         continue
-                cleanup.result()
+                    except Exception:  # noqa: BLE001 - inspect cleanup failure without replacing cancellation
+                        break
+                try:
+                    cleanup.result()
+                except Exception as exc:
+                    logger.warning("[vk] cancellation cleanup failed: %s", type(exc).__name__, exc_info=True)
+                    cancelled.add_note(f"VK storage cleanup failed: {type(exc).__name__}")
                 raise
             except BaseException:
                 await db.rollback()
                 raise
+
+    async def _settle_cancelled_transaction(
+        self, db: aiosqlite.Connection, on_cancel: Callable[[aiosqlite.Connection], Awaitable[None]] | None
+    ) -> None:
+        # The worker may commit before cancellation reaches its waiter. FIFO
+        # rollback settles that outcome before retiring the owned invocation.
+        await db.rollback()
+        if on_cancel is None:
+            return
+        while True:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                await on_cancel(db)
+                await db.commit()
+            except BaseException as exc:
+                await db.rollback()
+                if isinstance(exc, sqlite3.OperationalError) and getattr(exc, "sqlite_errorcode", None) in {
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                }:
+                    # Another connection can acquire the writer lock between
+                    # commit and cleanup. Retain ownership until it releases
+                    # the lock so cancelled rows never become recoverable.
+                    await asyncio.sleep(0.05)
+                    continue
+                raise
+            else:
+                return
 
     async def cursor(self, group_id: int) -> str | None:
         async with self._lock:
@@ -378,7 +410,7 @@ class VkStorage:
                 ) as cursor:
                     row = await cursor.fetchone()
                 if row is None:
-                    raise RuntimeError("rejected outbox chunk is no longer owned by this invocation")
+                    raise OutboxOwnershipLostError("rejected outbox chunk is no longer owned by this invocation")
                 first_index = int(row[0])
                 # Retain the rejected wire request for diagnostics, but replace
                 # its logical position atomically. Recovery then sees one ordered

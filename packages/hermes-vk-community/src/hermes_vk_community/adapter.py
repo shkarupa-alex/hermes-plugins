@@ -60,7 +60,7 @@ from hermes_vk_community.renderer import (
     format_data_for_chunk,
     split_message_with_spans,
 )
-from hermes_vk_community.storage import InboxRecord, VkStorage
+from hermes_vk_community.storage import InboxRecord, OutboxOwnershipLostError, VkStorage
 from hermes_vk_community.table_image import render_table_jpegs
 from tools import slash_confirm
 
@@ -364,7 +364,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
     def _send_retry_is_final(self, result: SendResult) -> bool:
         return _may_have_delivered(result) or (result.error_kind is not None and not result.retryable)
 
-    async def _send_text_segment(  # noqa: C901, PLR0911 - durable delivery has explicit failure/cancellation states
+    async def _send_text_segment(  # noqa: C901, PLR0911, PLR0912 - explicit durable failure/cancellation/ownership states
         self,
         peer_id: int,
         rendered: RenderedTextSegment,
@@ -428,7 +428,14 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
             except VkApiError as exc:
                 if exc.code == VK_TOO_LONG_ERROR and len(chunk) > MIN_MESSAGE_LIMIT:
-                    replacement = await self._try_rechunk_rejected(record)
+                    try:
+                        replacement = await self._try_rechunk_rejected(record)
+                    except OutboxOwnershipLostError:
+                        if delivered:
+                            return _partial_result(
+                                delivered, [item[0] for item in pending], delivered_characters=pending[index - 1][4]
+                            )
+                        return _delivery_unknown_result("VK outbox delivery is owned by another sender", record.id)
                     if replacement is None:
                         if delivered:
                             return _partial_result(
@@ -599,6 +606,10 @@ class VkCommunityAdapter(BasePlatformAdapter):
             raise RuntimeError("VK storage is not connected")
         try:
             return await self._rechunk_rejected(record)
+        except OutboxOwnershipLostError:
+            # This invocation's replacement belongs to another sender. Do not
+            # terminalize its fresh chunks or permit whole-message fallback.
+            raise
         except asyncio.CancelledError:
             await self._storage.terminalize_outbox_failure(
                 record,
@@ -670,7 +681,12 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     and exc.code == VK_TOO_LONG_ERROR
                     and len(record.wire_content) > MIN_MESSAGE_LIMIT
                 ):
-                    replacement = await self._try_rechunk_rejected(record)
+                    try:
+                        replacement = await self._try_rechunk_rejected(record)
+                    except OutboxOwnershipLostError:
+                        blocked_invocations.add(record.invocation_id)
+                        record_index += 1
+                        continue
                     if replacement is not None:
                         records[record_index : record_index + 1] = [item for item, _start, _end in replacement]
                         continue

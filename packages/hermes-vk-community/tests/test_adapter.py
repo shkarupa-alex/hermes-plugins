@@ -436,6 +436,55 @@ async def test_rechunk_failure_terminalizes_all_durable_replacements(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+async def test_lost_rechunk_ownership_preserves_the_other_senders_recoverable_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    other = VkStorage(storage.path)
+    await other.open(recover_inflight=False)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    original_rechunk = adapter._rechunk_rejected
+    replacements: list[OutboxRecord] = []
+    calls: list[dict[str, object]] = []
+
+    async def another_sender_rechunks_first(record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
+        replacements.extend(await other.prepare_outbox(456, ["x" * 256, "x" * 256], None, replace_rejected=record))
+        return await original_rechunk(record)
+
+    async def too_long(params: dict[str, object]) -> object:
+        calls.append(params)
+        raise VkApiError(914, "too long")
+
+    monkeypatch.setattr(adapter, "_rechunk_rejected", another_sender_rechunks_first)
+    adapter._send_chunk = too_long
+    try:
+        if lane == "recovery":
+            await storage.prepare_outbox(456, ["x" * 512, "tail"], None)
+            await adapter._recover_prepared_outbox()
+        else:
+            result = await adapter._send_with_retry("456", "x" * 600, base_delay=0)
+            assert not result.success
+            assert result.raw_response
+            assert result.raw_response["delivery_unknown"]
+            assert result.raw_response["partial_overflow"]
+        assert len(calls) == 1
+        prepared = await other.prepared_outbox()
+        assert [row.id for row in prepared[:2]] == [row.id for row in replacements]
+        assert len(prepared) == 3  # replacements and the unchanged original tail
+        await storage.close()
+        await storage.open()
+        assert [row.id for row in await storage.prepared_outbox()] == [row.id for row in prepared]
+    finally:
+        await other.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["send", "direct", "recovery"])
 async def test_cancellation_before_dispatch_is_not_delivery_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
