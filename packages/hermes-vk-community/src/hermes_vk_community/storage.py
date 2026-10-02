@@ -372,7 +372,7 @@ class VkStorage:
                 (state, (error or "")[:2048] or None, _now_ms(), row_id),
             )
 
-    async def prepare_outbox(  # noqa: PLR0913 - atomic replacement retains the original delivery contract
+    async def prepare_outbox(  # noqa: C901, PLR0913 - atomic preparation/replacement/cancellation ownership
         self,
         peer_id: int,
         chunks: list[str],
@@ -381,8 +381,10 @@ class VkStorage:
         recoverable: bool = True,
         format_data: list[dict[str, object] | None] | None = None,
         replace_rejected: OutboxRecord | None = None,
+        replacement_token: str | None = None,
     ) -> list[OutboxRecord]:
-        invocation_id = uuid.uuid4().hex
+        replacement_token = replacement_token or uuid.uuid4().hex
+        invocation_id = replacement_token
         now = _now_ms()
         records: list[OutboxRecord] = []
         formats = format_data or [None] * len(chunks)
@@ -390,6 +392,10 @@ class VkStorage:
             raise ValueError("format_data must align with chunks")
 
         async def cancel_preparation(db: aiosqlite.Connection) -> None:
+            if replace_rejected is not None and not await self._owns_outbox_failure(
+                db, replace_rejected, replacement_token
+            ):
+                return
             await db.execute(
                 "UPDATE outbox SET state='failed',error=?,updated_at_ms=? WHERE invocation_id=? AND state=?",
                 (
@@ -553,17 +559,33 @@ class VkStorage:
                 (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
             )
 
-    async def terminalize_outbox_failure(
+    @staticmethod
+    async def _owns_outbox_failure(
+        db: aiosqlite.Connection, record: OutboxRecord, replacement_token: str | None
+    ) -> bool:
+        # The rejected physical row moves to a per-attempt diagnostic invocation
+        # on replacement. Its token proves whose replacement actually committed.
+        # Check under the cleanup's writer transaction, including cancellation
+        # before the replacement transaction could inspect the rejected row.
+        async with db.execute("SELECT invocation_id FROM outbox WHERE id=?", (record.id,)) as cursor:
+            row = await cursor.fetchone()
+        return row is not None and str(row[0]) in {record.invocation_id, replacement_token}
+
+    async def terminalize_outbox_failure(  # noqa: PLR0913 - durable cleanup includes replacement ownership evidence
         self,
         record: OutboxRecord,
         state: str,
         error: str,
         tail_records: list[OutboxRecord],
         tail_error: str,
-    ) -> None:
-        """Atomically terminate a failed chunk and every later prepared chunk."""
+        *,
+        replacement_token: str | None = None,
+    ) -> bool:
+        """Terminate owned chunks atomically, returning False if ownership moved."""
         now = _now_ms()
         async with self._transaction() as db:
+            if not await self._owns_outbox_failure(db, record, replacement_token):
+                return False
             await db.execute(
                 "UPDATE outbox SET state=?,error=?,updated_at_ms=? WHERE id=?",
                 (state, (error or "delivery failed")[:2048], now, record.id),
@@ -578,6 +600,7 @@ class VkStorage:
                 f"WHERE state='prepared' AND (invocation_id=? OR id IN ({placeholders}))",
                 ((tail_error or "unsent tail is terminal")[:2048], now, record.invocation_id, *tail_ids),
             )
+        return True
 
     async def counts(self) -> dict[str, int]:
         async with self._lock:

@@ -7,6 +7,7 @@ import secrets
 import shutil
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Never, cast
@@ -371,23 +372,42 @@ class VkCommunityAdapter(BasePlatformAdapter):
             return await self._send_table_segment(int(chat_id), segment, reply_to)
         return await self.send_image(chat_id, segment.url, caption=segment.alt or None, reply_to=reply_to)
 
-    async def _terminalize_failed_send(
-        self, record: OutboxRecord, state: str, error: str, tail_records: list[OutboxRecord], tail_error: str
-    ) -> None:
+    async def _terminalize_failed_send(  # noqa: PLR0913 - retain durable replacement ownership on cleanup
+        self,
+        record: OutboxRecord,
+        state: str,
+        error: str,
+        tail_records: list[OutboxRecord],
+        tail_error: str,
+        *,
+        replacement_token: str | None = None,
+    ) -> bool | None:
         if self._storage is None:
-            return
+            return None
         try:
-            await self._storage.terminalize_outbox_failure(record, state, error, tail_records, tail_error)
+            return await self._storage.terminalize_outbox_failure(
+                record, state, error, tail_records, tail_error, replacement_token=replacement_token
+            )
         except Exception as exc:
             logger.warning("[vk] failed to persist send diagnostics: %s", type(exc).__name__, exc_info=True)
+            return None
 
-    async def _terminalize_cancelled_send(
-        self, record: OutboxRecord, state: str, error: str, tail_records: list[OutboxRecord], tail_error: str
+    async def _terminalize_cancelled_send(  # noqa: PLR0913 - retain durable replacement ownership on cancellation
+        self,
+        record: OutboxRecord,
+        state: str,
+        error: str,
+        tail_records: list[OutboxRecord],
+        tail_error: str,
+        *,
+        replacement_token: str | None = None,
     ) -> None:
         async def settle() -> None:
             try:
                 async with asyncio.timeout(CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS):
-                    await self._terminalize_failed_send(record, state, error, tail_records, tail_error)
+                    await self._terminalize_failed_send(
+                        record, state, error, tail_records, tail_error, replacement_token=replacement_token
+                    )
             except TimeoutError:
                 logger.warning("[vk] cancellation terminalization timed out; remaining outbox rows may be recoverable")
 
@@ -632,7 +652,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 return _partial_send_result([confirmed_id], {"failed_segment": "storage", "delivered_chunks": 1})
             return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
 
-    async def _rechunk_rejected(self, record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
+    async def _rechunk_rejected(
+        self, record: OutboxRecord, *, replacement_token: str
+    ) -> list[tuple[OutboxRecord, int, int]]:
         if self._storage is None:
             raise RuntimeError("VK storage is not connected")
         self._effective_limit = max(MIN_MESSAGE_LIMIT, min(self._effective_limit, len(record.wire_content) // 2))
@@ -643,14 +665,16 @@ class VkCommunityAdapter(BasePlatformAdapter):
             record.reply_target,
             format_data=[format_data_for_chunk(record.format_data, span) for span in spans],
             replace_rejected=record,
+            replacement_token=replacement_token,
         )
         return [(item, span.start, span.end) for item, span in zip(replacement, spans, strict=True)]
 
     async def _try_rechunk_rejected(self, record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]] | None:
         if self._storage is None:
             raise RuntimeError("VK storage is not connected")
+        replacement_token = uuid.uuid4().hex
         try:
-            return await self._rechunk_rejected(record)
+            return await self._rechunk_rejected(record, replacement_token=replacement_token)
         except OutboxOwnershipLostError:
             # This invocation's replacement belongs to another sender. Do not
             # terminalize its fresh chunks or permit whole-message fallback.
@@ -662,16 +686,22 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 "rechunk cancelled after known size refusal",
                 [],
                 "blocked after cancelled rechunk",
+                replacement_token=replacement_token,
             )
             raise
-        except Exception as exc:  # noqa: BLE001 - preserve the known refusal and terminalize every durable tail
-            await self._terminalize_failed_send(
+        except Exception as exc:
+            owned = await self._terminalize_failed_send(
                 record,
                 "failed",
                 f"rechunk failed: {type(exc).__name__}",
                 [],
                 "blocked after failed rechunk",
+                replacement_token=replacement_token,
             )
+            if not owned:
+                # Cleanup either proved a transfer or could not inspect it.
+                # Another sender may now deliver this logical invocation.
+                raise OutboxOwnershipLostError("rechunk cleanup could not establish owned terminal state") from exc
             logger.warning("[vk] could not rechunk a rejected message: %s", type(exc).__name__)
             return None
 

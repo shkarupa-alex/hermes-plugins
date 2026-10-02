@@ -400,9 +400,9 @@ async def test_rechunk_failure_terminalizes_all_durable_replacements(
     adapter._client = cast("Any", object())
     original_rechunk = adapter._rechunk_rejected
 
-    async def broken_rechunk(record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
+    async def broken_rechunk(record: OutboxRecord, *, replacement_token: str) -> list[tuple[OutboxRecord, int, int]]:
         if "after_commit" in failure:
-            await original_rechunk(record)
+            await original_rechunk(record, replacement_token=replacement_token)
         if failure.startswith("cancel"):
             raise asyncio.CancelledError
         raise OSError("rechunk failed")
@@ -453,9 +453,11 @@ async def test_lost_rechunk_ownership_preserves_the_other_senders_recoverable_ch
     replacements: list[OutboxRecord] = []
     calls: list[dict[str, object]] = []
 
-    async def another_sender_rechunks_first(record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
+    async def another_sender_rechunks_first(
+        record: OutboxRecord, *, replacement_token: str
+    ) -> list[tuple[OutboxRecord, int, int]]:
         replacements.extend(await other.prepare_outbox(456, ["x" * 256, "x" * 256], None, replace_rejected=record))
-        return await original_rechunk(record)
+        return await original_rechunk(record, replacement_token=replacement_token)
 
     async def too_long(params: dict[str, object]) -> object:
         calls.append(params)
@@ -481,6 +483,94 @@ async def test_lost_rechunk_ownership_preserves_the_other_senders_recoverable_ch
         await storage.open()
         assert [row.id for row in await storage.prepared_outbox()] == [row.id for row in prepared]
     finally:
+        await other.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+@pytest.mark.parametrize("interruption", ["cancel", "busy"])
+async def test_interrupted_stale_rechunk_preserves_another_senders_replacements(  # noqa: PLR0915 - real lock interleaving
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, interruption: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    other = VkStorage(storage.path)
+    await other.open(recover_inflight=False)
+    blocker = sqlite3.connect(storage.path)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    original_rechunk = adapter._rechunk_rejected
+    original_settle = storage._settle_cancelled_transaction
+    begin_started = asyncio.Event()
+    cancellation_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    expected: list[OutboxRecord] = []
+    calls: list[dict[str, object]] = []
+
+    def trace(statement: str) -> None:
+        if statement == "BEGIN IMMEDIATE":
+            loop.call_soon_threadsafe(begin_started.set)
+
+    async def settle(*args: Any, **kwargs: Any) -> None:  # noqa: ANN401 - observe actual transaction settlement
+        cancellation_started.set()
+        await original_settle(*args, **kwargs)
+
+    async def another_sender_rechunks_first(
+        record: OutboxRecord, *, replacement_token: str
+    ) -> list[tuple[OutboxRecord, int, int]]:
+        await other.prepare_outbox(456, ["x" * 256, "x" * 256], None, replace_rejected=record)
+        expected.extend(await other.prepared_outbox())
+        if interruption == "busy":
+            await storage._connection().execute("PRAGMA busy_timeout=0")
+        blocker.execute("BEGIN IMMEDIATE")
+        await cast("Any", storage._connection()).set_trace_callback(trace)
+        return await original_rechunk(record, replacement_token=replacement_token)
+
+    async def too_long(params: dict[str, object]) -> object:
+        calls.append(params)
+        raise VkApiError(914, "too long")
+
+    monkeypatch.setattr(adapter, "_rechunk_rejected", another_sender_rechunks_first)
+    monkeypatch.setattr(storage, "_settle_cancelled_transaction", settle)
+    adapter._send_chunk = too_long
+    if lane == "recovery":
+        await storage.prepare_outbox(456, ["x" * 512, "tail"], None)
+        operation = adapter._recover_prepared_outbox()
+    else:
+        operation = adapter.send("456", "x" * 600)
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(begin_started.wait(), 1)
+        if interruption == "cancel":
+            task.cancel()
+            await asyncio.wait_for(cancellation_started.wait(), 1)
+            blocker.rollback()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+        else:
+            result = await asyncio.wait_for(task, 2)
+            if lane == "send":
+                assert isinstance(result, SendResult)
+                assert not result.success
+                assert result.raw_response
+                assert result.raw_response["delivery_unknown"]
+                assert result.raw_response["partial_overflow"]
+            blocker.rollback()
+        assert len(calls) == 1
+        assert len(expected) == 3
+        assert await other.prepared_outbox() == expected
+        await storage.close()
+        await storage.open()
+        assert await storage.prepared_outbox() == expected
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == 1
+    finally:
+        blocker.rollback()
+        blocker.close()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await other.close()
         await storage.close()
 
@@ -647,10 +737,16 @@ async def test_repeated_cancellation_settles_outbox_across_a_local_writer_lock( 
         return await contend_after_read(await original_prepared())
 
     async def terminalize(
-        record: OutboxRecord, state: str, error: str, tail_records: list[OutboxRecord], tail_error: str
+        record: OutboxRecord,
+        state: str,
+        error: str,
+        tail_records: list[OutboxRecord],
+        tail_error: str,
+        *,
+        replacement_token: str | None = None,
     ) -> None:
         cleanup_started.set()
-        await original_terminalize(record, state, error, tail_records, tail_error)
+        await original_terminalize(record, state, error, tail_records, tail_error, replacement_token=replacement_token)
 
     async def transport(params: dict[str, object]) -> object:
         calls.append(params)
