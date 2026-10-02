@@ -459,6 +459,61 @@ async def test_cancelled_outbox_recovery_terminalizes_its_remaining_invocation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("head_outcome", ["sent", "rejected"])
+async def test_gateway_recovery_cannot_take_an_active_standalone_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_client: list[str],
+    head_outcome: str,
+) -> None:
+    config = _config(tmp_path)
+    config.extra["max_message_length"] = 256
+    receiver = build_adapter(config)
+    receiver._client = cast("Any", object())
+    receiver._storage = VkStorage(tmp_path / "state.sqlite3")
+    started, release = asyncio.Event(), asyncio.Event()
+    writer_calls: list[dict[str, object]] = []
+    recovery_calls: list[dict[str, object]] = []
+
+    async def transport(self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        if self is receiver:
+            recovery_calls.append(params)
+            return 42
+        writer_calls.append(params)
+        started.set()
+        await release.wait()
+        if head_outcome == "rejected":
+            raise VkApiError(15, "denied")
+        return len(writer_calls)
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    task = asyncio.create_task(send_standalone(config, "456", "x" * 600))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        # A gateway restart opens a second connection while the cron request
+        # remains in flight. It must not send that invocation's unconfirmed tail.
+        await receiver._storage.open()
+        assert await receiver._storage.prepared_outbox() == []
+        await receiver._recover_prepared_outbox()
+        assert recovery_calls == []
+        release.set()
+        result = await task
+        assert bool(result.get("success")) is (head_outcome == "sent")
+        if head_outcome == "sent":
+            assert len(writer_calls) == 3
+            assert len(await receiver._storage.diagnostic_rows(outbox_state="sent")) == 3
+        else:
+            assert len(writer_calls) == 1
+            assert len(await receiver._storage.diagnostic_rows(outbox_state="failed")) == 3
+        assert delivery_client[-1] == "closed"
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        await receiver._storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lane", ["native", "live_router", "gateway_retry"])
 async def test_partial_report_is_a_failure_without_duplicate_head(
     tmp_path: Path,

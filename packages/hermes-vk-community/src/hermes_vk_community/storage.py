@@ -125,7 +125,7 @@ class VkStorage:
         self.path = path
         self._db: aiosqlite.Connection | None = None
 
-    async def open(self) -> None:
+    async def open(self, *, recover_inflight: bool = True) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
         self.path.chmod(0o600)
@@ -134,7 +134,8 @@ class VkStorage:
         await self._db.execute("PRAGMA synchronous=FULL")
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._migrate()
-        await self._db.execute("UPDATE outbox SET state='delivery_unknown' WHERE state='sending'")
+        if recover_inflight:
+            await self._db.execute("UPDATE outbox SET state='delivery_unknown' WHERE state='sending'")
         await self._db.commit()
 
     async def _migrate(self) -> None:
@@ -361,9 +362,17 @@ class VkStorage:
 
     async def prepared_outbox(self) -> list[OutboxRecord]:
         db = self._connection()
+        # Another process can still own an in-flight prefix. Recover its tail
+        # only after that prefix is confirmed, or replay the prepared prefix
+        # first using its persisted random_id.
         async with db.execute(
-            "SELECT id,invocation_id,peer_id,chunk_index,random_id,wire_content,reply_target,format_data_json "
-            "FROM outbox WHERE state='prepared' AND wire_content IS NOT NULL ORDER BY id"
+            "SELECT pending.id,pending.invocation_id,pending.peer_id,pending.chunk_index,pending.random_id,"
+            "pending.wire_content,pending.reply_target,pending.format_data_json "
+            "FROM outbox AS pending WHERE pending.state='prepared' AND pending.wire_content IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM outbox AS earlier "
+            "WHERE earlier.invocation_id=pending.invocation_id AND earlier.chunk_index<pending.chunk_index "
+            "AND (earlier.state NOT IN ('prepared','sent') "
+            "OR (earlier.state='prepared' AND earlier.wire_content IS NULL))) ORDER BY pending.id"
         ) as cursor:
             rows = await cursor.fetchall()
         return [

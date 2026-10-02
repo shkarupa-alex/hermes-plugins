@@ -216,7 +216,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 # Standalone cron has no connected adapter; read the same profile's
                 # pairing grants before accessing credentials or the network.
                 self._storage = VkStorage(self.settings.resolve_storage_path(Path(get_hermes_home())))
-                await self._storage.open()
+                await self._storage.open(recover_inflight=False)
             if denied := await self._delivery_target_error(chat_id):
                 return {"error": denied.error}
             token = get_secret("VK_COMMUNITY_TOKEN")
@@ -234,7 +234,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             await self._verify_group()
             if self._storage is None:
                 self._storage = VkStorage(self.settings.resolve_storage_path(Path(get_hermes_home())))
-                await self._storage.open()
+                await self._storage.open(recover_inflight=False)
             return await self._send_report(chat_id, content, media_files or [], force_document=force_document)
         except VkApiError as exc:
             return {"error": _safe_api_error(exc)}

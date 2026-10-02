@@ -48,6 +48,39 @@ async def test_sending_rows_become_delivery_unknown_after_restart(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_standalone_connection_preserves_another_writers_inflight_request(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    writer = VkStorage(path)
+    standalone = VkStorage(path)
+    await writer.open()
+    try:
+        record = (await writer.prepare_outbox(2, ["hello"], None))[0]
+        await writer.mark_outbox(record.id, "sending")
+        await standalone.open(recover_inflight=False)
+        assert len(await writer.diagnostic_rows(outbox_state="sending")) == 1
+        assert (await standalone.counts())["outbox_delivery_unknown"] == 0
+    finally:
+        await standalone.close()
+        await writer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_state", ["sending", "delivery_unknown", "failed", "sent"])
+async def test_recovery_requires_a_recoverable_or_confirmed_prefix(tmp_path: Path, prefix_state: str) -> None:
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    try:
+        chunks = await storage.prepare_outbox(2, ["head", "tail 1", "tail 2"], None)
+        unrelated = (await storage.prepare_outbox(3, ["unrelated"], None))[0]
+        await storage.mark_outbox(chunks[0].id, prefix_state)
+        recovered = await storage.prepared_outbox()
+        expected = [*chunks[1:], unrelated] if prefix_state == "sent" else [unrelated]
+        assert [row.id for row in recovered] == [row.id for row in expected]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_oversized_update_is_quarantined_before_cursor_advances(tmp_path: Path) -> None:
     storage = VkStorage(tmp_path / "state.sqlite3")
     await storage.open()
