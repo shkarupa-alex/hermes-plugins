@@ -62,7 +62,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10.2.0
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           enable-cache: true
 
       - name: Apply and verify the release version

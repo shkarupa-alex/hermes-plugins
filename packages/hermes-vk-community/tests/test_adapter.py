@@ -1,6 +1,8 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
+import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,17 +21,17 @@ from hermes_vk_community.adapter import (
     _is_retryable_send_error,
     _source_prefix_for_rendered,
 )
-from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkLongPollProtocolError
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import InteractionPayload, LongPollLease, LongPollResponse, VkAttachment, VkMessage
 from hermes_vk_community.plugin import build_adapter
-from hermes_vk_community.renderer import RenderedTableSegment, RenderedTextSegment, RichVkRenderer
+from hermes_vk_community.renderer import RenderedTableSegment, RenderedTextSegment, RenderedVkMessage, RichVkRenderer
 from hermes_vk_community.storage import InboxRecord, VkStorage
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from hermes_vk_community.client import VkApiClient
-    from hermes_vk_community.storage import InboxState
+    from hermes_vk_community.storage import InboxState, OutboxRecord
 
 
 class StorageSpy:
@@ -308,6 +310,591 @@ async def test_voice_attachment_reaches_stt_without_cached_file_note(
 
 
 @pytest.mark.asyncio
+async def test_chat_send_retries_after_adapter_reconnects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _adapter()
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    calls: list[object] = []
+
+    class Client:
+        async def call(self, _method: str, params: dict[str, object]) -> int:
+            calls.append(params)
+            return 42
+
+    async def reconnect(_delay: float) -> None:
+        adapter._client = cast("VkApiClient", Client())
+
+    adapter._storage = storage
+    monkeypatch.setattr("hermes_vk_community.adapter.asyncio.sleep", reconnect)
+    try:
+        result = await adapter._send_with_retry("456", "reply", base_delay=0)
+        assert result.success
+        assert len(calls) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_permanent_target_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _adapter()
+    original = adapter.send
+    calls: list[str] = []
+
+    async def send(chat_id: str, content: str, **_kwargs: object) -> SendResult:
+        calls.append(content)
+        return await original(chat_id, content)
+
+    monkeypatch.setattr(adapter, "send", send)
+    result = await adapter._send_with_retry("999", "reply")
+    assert not result.success
+    assert result.error_kind == "forbidden"
+    assert calls == ["reply"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 503])
+async def test_transient_http_send_reuses_the_persisted_random_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    from tenacity import wait_none
+
+    adapter = _adapter()
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    random_ids: list[object] = []
+
+    class Client:
+        async def call(self, _method: str, params: dict[str, object]) -> int:
+            random_ids.append(params["random_id"])
+            if len(random_ids) < 3:
+                raise VkHttpError(status, "API")
+            return 42
+
+    def no_wait(**_kwargs: object) -> wait_none:
+        return wait_none()
+
+    monkeypatch.setattr("hermes_vk_community.adapter.wait_random_exponential", no_wait)
+    adapter._storage = storage
+    adapter._client = cast("VkApiClient", Client())
+    try:
+        result = await adapter._send_with_retry("456", "reply")
+        assert result.success
+        assert len(random_ids) == 3
+        assert len(set(random_ids)) == 1
+        assert len(await storage.diagnostic_rows(outbox_state="sent")) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+@pytest.mark.parametrize("failure", ["before", "after_commit", "cancel_before", "cancel_after_commit"])
+async def test_rechunk_failure_terminalizes_all_durable_replacements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, failure: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    original_rechunk = adapter._rechunk_rejected
+
+    async def broken_rechunk(record: OutboxRecord, *, replacement_token: str) -> list[tuple[OutboxRecord, int, int]]:
+        if "after_commit" in failure:
+            await original_rechunk(record, replacement_token=replacement_token)
+        if failure.startswith("cancel"):
+            raise asyncio.CancelledError
+        raise OSError("rechunk failed")
+
+    async def too_long(_self: VkCommunityAdapter, _params: dict[str, object]) -> object:
+        raise VkApiError(914, "too long")
+
+    monkeypatch.setattr(adapter, "_rechunk_rejected", broken_rechunk)
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", too_long)
+    try:
+        if lane == "recovery":
+            await storage.prepare_outbox(456, ["x" * 512, "tail 1", "tail 2"], None)
+            operation = adapter._recover_prepared_outbox()
+        else:
+            operation = adapter._send_with_retry("456", "x" * 1100, base_delay=0)
+        if failure.startswith("cancel"):
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        else:
+            result = await operation
+            if lane == "send":
+                assert isinstance(result, SendResult)
+                assert not result.success
+                assert result.error_kind == "internal"
+        await storage.close()
+        await storage.open()
+        assert await storage.prepared_outbox() == []
+        assert (await storage.counts())["outbox_delivery_unknown"] == 0
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == (5 if "after_commit" in failure else 3)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+async def test_lost_rechunk_ownership_preserves_the_other_senders_recoverable_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    other = VkStorage(storage.path)
+    await other.open(recover_inflight=False)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    original_rechunk = adapter._rechunk_rejected
+    replacements: list[OutboxRecord] = []
+    calls: list[dict[str, object]] = []
+
+    async def another_sender_rechunks_first(
+        record: OutboxRecord, *, replacement_token: str
+    ) -> list[tuple[OutboxRecord, int, int]]:
+        replacements.extend(await other.prepare_outbox(456, ["x" * 256, "x" * 256], None, replace_rejected=record))
+        return await original_rechunk(record, replacement_token=replacement_token)
+
+    async def too_long(params: dict[str, object]) -> object:
+        calls.append(params)
+        raise VkApiError(914, "too long")
+
+    monkeypatch.setattr(adapter, "_rechunk_rejected", another_sender_rechunks_first)
+    adapter._send_chunk = too_long
+    try:
+        if lane == "recovery":
+            await storage.prepare_outbox(456, ["x" * 512, "tail"], None)
+            await adapter._recover_prepared_outbox()
+        else:
+            result = await adapter._send_with_retry("456", "x" * 600, base_delay=0)
+            assert not result.success
+            assert result.raw_response
+            assert result.raw_response["delivery_unknown"]
+            assert result.raw_response["partial_overflow"]
+        assert len(calls) == 1
+        prepared = await other.prepared_outbox()
+        assert [row.id for row in prepared[:2]] == [row.id for row in replacements]
+        assert len(prepared) == 3  # replacements and the unchanged original tail
+        await storage.close()
+        await storage.open()
+        assert [row.id for row in await storage.prepared_outbox()] == [row.id for row in prepared]
+    finally:
+        await other.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+@pytest.mark.parametrize("interruption", ["cancel", "busy"])
+async def test_interrupted_stale_rechunk_preserves_another_senders_replacements(  # noqa: PLR0915 - real lock interleaving
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, interruption: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    other = VkStorage(storage.path)
+    await other.open(recover_inflight=False)
+    blocker = sqlite3.connect(storage.path)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    original_rechunk = adapter._rechunk_rejected
+    original_settle = storage._settle_cancelled_transaction
+    begin_started = asyncio.Event()
+    cancellation_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    expected: list[OutboxRecord] = []
+    calls: list[dict[str, object]] = []
+
+    def trace(statement: str) -> None:
+        if statement == "BEGIN IMMEDIATE":
+            loop.call_soon_threadsafe(begin_started.set)
+
+    async def settle(*args: Any, **kwargs: Any) -> None:  # noqa: ANN401 - observe actual transaction settlement
+        cancellation_started.set()
+        await original_settle(*args, **kwargs)
+
+    async def another_sender_rechunks_first(
+        record: OutboxRecord, *, replacement_token: str
+    ) -> list[tuple[OutboxRecord, int, int]]:
+        await other.prepare_outbox(456, ["x" * 256, "x" * 256], None, replace_rejected=record)
+        expected.extend(await other.prepared_outbox())
+        if interruption == "busy":
+            await storage._connection().execute("PRAGMA busy_timeout=0")
+        blocker.execute("BEGIN IMMEDIATE")
+        await cast("Any", storage._connection()).set_trace_callback(trace)
+        return await original_rechunk(record, replacement_token=replacement_token)
+
+    async def too_long(params: dict[str, object]) -> object:
+        calls.append(params)
+        raise VkApiError(914, "too long")
+
+    monkeypatch.setattr(adapter, "_rechunk_rejected", another_sender_rechunks_first)
+    monkeypatch.setattr(storage, "_settle_cancelled_transaction", settle)
+    adapter._send_chunk = too_long
+    if lane == "recovery":
+        await storage.prepare_outbox(456, ["x" * 512, "tail"], None)
+        operation = adapter._recover_prepared_outbox()
+    else:
+        operation = adapter.send("456", "x" * 600)
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(begin_started.wait(), 1)
+        if interruption == "cancel":
+            task.cancel()
+            await asyncio.wait_for(cancellation_started.wait(), 1)
+            blocker.rollback()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+        else:
+            result = await asyncio.wait_for(task, 2)
+            if lane == "send":
+                assert isinstance(result, SendResult)
+                assert not result.success
+                assert result.raw_response
+                assert result.raw_response["delivery_unknown"]
+                assert result.raw_response["partial_overflow"]
+            blocker.rollback()
+        assert len(calls) == 1
+        assert len(expected) == 3
+        assert await other.prepared_outbox() == expected
+        await storage.close()
+        await storage.open()
+        assert await storage.prepared_outbox() == expected
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == 1
+    finally:
+        blocker.rollback()
+        blocker.close()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await other.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access", ["allowlist_removed", "pairing_disabled", "pairing_revoked", "pairing_active"])
+async def test_recovery_rechecks_access_and_continues_authorized_invocations(tmp_path: Path, access: str) -> None:
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "group_id": 123,
+            "allowed_user_ids": [456, 999] if access == "allowlist_removed" else [456],
+            "pairing": {"enabled": True},
+        },
+    )
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    calls: list[dict[str, object]] = []
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    try:
+        if access.startswith("pairing"):
+            await storage.create_pairing_code("OLD", 60)
+            assert await storage.consume_pairing_code("OLD", 999)
+        admitted = build_adapter(config)
+        admitted._storage = storage
+        assert await admitted._delivery_target_error("999") is None
+        await storage.prepare_outbox(999, ["queued report", "queued tail"], None)
+        await storage.prepare_outbox(456, ["still authorized"], None)
+        if access == "pairing_revoked":
+            async with storage._transaction() as db:
+                await db.execute("DELETE FROM paired_users WHERE user_id=999")
+        await storage.close()
+        await storage.open()
+        config.extra["allowed_user_ids"] = [456]
+        config.extra["pairing"] = {"enabled": access != "pairing_disabled"}
+        restarted = build_adapter(config)
+        restarted._storage = storage
+        restarted._client = cast("Any", object())
+        restarted._send_chunk = transport
+        if access != "pairing_active":
+            assert not (await restarted.send("999", "ordinary send is forbidden")).success
+        await restarted._recover_prepared_outbox()
+        assert [call["peer_id"] for call in calls] == ([999, 999, 456] if access == "pairing_active" else [456])
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == (0 if access == "pairing_active" else 2)
+        assert await storage.prepared_outbox() == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["next_chunk", "sent_commit", "next_segment", "rechunk", "direct", "table_page"])
+async def test_confirmed_ids_survive_failed_sqlite_diagnostic_writes(  # noqa: C901 - distinct real SQLite failure boundaries
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512 if boundary == "rechunk" else 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    await storage._connection().execute("PRAGMA busy_timeout=0")
+    blocker = sqlite3.connect(storage.path)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    calls: list[dict[str, object]] = []
+    original_mark = storage.mark_outbox
+
+    async def mark_then_contend(row_id: int, state: str, **kwargs: Any) -> None:  # noqa: ANN401 - storage contract
+        await original_mark(row_id, state, **kwargs)
+        if state == "sent" and boundary in {"next_chunk", "next_segment"}:
+            blocker.execute("BEGIN IMMEDIATE")
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        if boundary in {"sent_commit", "direct"} or (boundary in {"rechunk", "table_page"} and len(calls) == 2):
+            blocker.execute("BEGIN IMMEDIATE")
+        if boundary == "rechunk" and len(calls) == 2:
+            raise VkApiError(914, "too long")
+        return 41 + len(calls)
+
+    monkeypatch.setattr(storage, "mark_outbox", mark_then_contend)
+    adapter._send_chunk = transport
+    if boundary in {"next_segment", "table_page"}:
+
+        def render(_content: str) -> RenderedVkMessage:
+            return RenderedVkMessage(
+                "headtail",
+                None,
+                "headtail",
+                frozenset(),
+                (RenderedTableSegment(("header",), (("cell",),)),)
+                if boundary == "table_page"
+                else (RenderedTextSegment("head"), RenderedTextSegment("tail")),
+            )
+
+        adapter._renderer = cast("Any", SimpleNamespace(render_markdown=render))
+    if boundary == "table_page":
+
+        def table_paths(_table: RenderedTableSegment, _directory: Path) -> list[Path]:
+            return [tmp_path / "1.jpg", tmp_path / "2.jpg"]
+
+        monkeypatch.setattr("hermes_vk_community.adapter.render_table_jpegs", table_paths)
+
+        async def upload(peer_id: int, path: Path) -> str:
+            return f"photo{peer_id}_{path.stem}"
+
+        adapter._upload_photo = upload
+    try:
+        result = (
+            await adapter._send_direct(456, "caption", attachment="doc1_1")
+            if boundary == "direct"
+            else await adapter._send_with_retry("456", "x" * 1100, base_delay=0)
+        )
+        assert result.message_id == ("43" if boundary == "table_page" else "42")
+        assert not result.retryable
+        raw = cast("dict[str, Any]", result.raw_response)
+        assert raw["partial_overflow"]
+        assert raw["delivered_chunks"] == (2 if boundary == "table_page" else 1)
+        if boundary in {"next_chunk", "sent_commit", "rechunk"}:
+            assert raw["partial_delivery"]["delivered_characters"] == (512 if boundary == "rechunk" else 256)
+        assert len(calls) == (2 if boundary in {"rechunk", "table_page"} else 1)
+    finally:
+        blocker.rollback()
+        blocker.close()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+@pytest.mark.parametrize("contention", ["brief", "persistent"])
+async def test_repeated_cancellation_settles_outbox_across_a_local_writer_lock(  # noqa: C901, PLR0915 - real transaction/shutdown interleavings
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, lane: str, contention: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    writer_started, release_writer, cleanup_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    writers: list[asyncio.Task[None]] = []
+    calls: list[dict[str, object]] = []
+    original_prepare, original_prepared = storage.prepare_outbox, storage.prepared_outbox
+    original_terminalize = adapter._terminalize_failed_send
+
+    async def concurrent_writer() -> None:
+        async with storage._transaction() as db:
+            await db.execute("INSERT INTO paired_users(user_id,paired_at_ms) VALUES(123,0)")
+            writer_started.set()
+            await release_writer.wait()
+
+    async def contend_after_read(records: list[OutboxRecord]) -> list[OutboxRecord]:
+        if not writers:
+            writers.append(asyncio.create_task(concurrent_writer()))
+            await writer_started.wait()
+        return records
+
+    async def prepare_then_contend(*args: Any, **kwargs: Any) -> list[OutboxRecord]:  # noqa: ANN401 - storage contract
+        return await contend_after_read(await original_prepare(*args, **kwargs))
+
+    async def prepared_then_contend() -> list[OutboxRecord]:
+        return await contend_after_read(await original_prepared())
+
+    async def terminalize(
+        record: OutboxRecord,
+        state: str,
+        error: str,
+        tail_records: list[OutboxRecord],
+        tail_error: str,
+        *,
+        replacement_token: str | None = None,
+    ) -> None:
+        cleanup_started.set()
+        await original_terminalize(record, state, error, tail_records, tail_error, replacement_token=replacement_token)
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    adapter._send_chunk = transport
+    monkeypatch.setattr(adapter, "_terminalize_failed_send", terminalize)
+    if contention == "persistent":
+        monkeypatch.setattr("hermes_vk_community.adapter.CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    if lane == "recovery":
+        await storage.prepare_outbox(456, ["head", "tail 1", "tail 2"], None)
+        monkeypatch.setattr(storage, "prepared_outbox", prepared_then_contend)
+        operation = adapter._recover_prepared_outbox()
+    else:
+        monkeypatch.setattr(storage, "prepare_outbox", prepare_then_contend)
+        operation = adapter.send("456", "x" * 600)
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(writer_started.wait(), 1)
+        await asyncio.sleep(0)  # records returned; sending now waits for the writer's lock
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        if contention == "brief":
+            release_writer.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert calls == []
+        release_writer.set()
+        await asyncio.gather(*writers)
+        if contention == "persistent":
+            assert "cancellation terminalization timed out" in caplog.text
+            assert len(await storage.prepared_outbox()) == 3
+        else:
+            assert len(await storage.diagnostic_rows(outbox_state="failed")) == 3
+            await storage.close()
+            await storage.open()
+            await adapter._recover_prepared_outbox()
+            assert calls == []
+    finally:
+        release_writer.set()
+        task.cancel()
+        await asyncio.gather(task, *writers, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "direct", "recovery"])
+async def test_cancellation_before_dispatch_is_not_delivery_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    started = asyncio.Event()
+    original_mark = storage.mark_outbox
+
+    async def blocked_mark(row_id: int, state: str, **kwargs: Any) -> None:  # noqa: ANN401 - adapter write contract
+        if state == "sending":
+            started.set()
+            await asyncio.Event().wait()
+        await original_mark(row_id, state, **kwargs)
+
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("cancelled request reached the transport")
+
+    monkeypatch.setattr(storage, "mark_outbox", blocked_mark)
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", forbidden)
+    if lane == "send":
+        operation = adapter.send("456", "x" * 600)
+    elif lane == "direct":
+        operation = adapter._send_direct(456, "caption")
+    else:
+        await storage.prepare_outbox(456, ["head", "tail 1", "tail 2"], None)
+        operation = adapter._recover_prepared_outbox()
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert (await storage.counts())["outbox_delivery_unknown"] == 0
+        assert await storage.prepared_outbox() == []
+        rows = await storage.diagnostic_rows(outbox_state="failed")
+        assert len(rows) == (1 if lane == "direct" else 3)
+        assert "before dispatch" in str(rows[0]["error"])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "direct"])
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_cancelled_initial_outbox_commit_cannot_be_recovered(
+    tmp_path: Path, lane: str, *, repeat_cancel: bool
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    calls: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    cancel_count = 0
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    def cancel_on_commit(statement: str) -> None:
+        nonlocal cancel_count
+        if statement == "COMMIT" and (cancel_count == 0 or (repeat_cancel and cancel_count == 1)):
+            cancel_count += 1
+            loop.call_soon_threadsafe(task.cancel)
+
+    adapter._send_chunk = transport
+    await cast("Any", storage._connection()).set_trace_callback(cancel_on_commit)
+    operation = (
+        adapter.send("456", "x" * 600) if lane == "send" else adapter._send_direct(456, "caption", attachment="doc1_1")
+    )
+    task = asyncio.create_task(operation)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancel_count == (2 if repeat_cancel else 1)
+        assert calls == []
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == (3 if lane == "send" else 1)
+        await storage.close()
+        await storage.open()
+        assert await storage.prepared_outbox() == []
+        assert (await storage.counts())["outbox_delivery_unknown"] == 0
+        await adapter._recover_prepared_outbox()
+        assert calls == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_error_914_progressively_reduces_and_caches_limit(tmp_path: Path) -> None:
     adapter = _adapter()
     storage = VkStorage(tmp_path / "state.sqlite3")
@@ -333,6 +920,96 @@ async def test_error_914_progressively_reduces_and_caches_limit(tmp_path: Path) 
         assert result.success
         assert adapter._effective_limit == 500
         assert client.lengths == [1000, 500, 500]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed_replacements", [0, 1, 2])
+async def test_rechunked_invocation_recovers_in_order_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confirmed_replacements: int
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    path = tmp_path / "state.sqlite3"
+    storage = VkStorage(path)
+    await storage.open()
+    delivered: list[str] = []
+    requests = 0
+
+    class ProcessCrash(BaseException):
+        pass
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        nonlocal requests
+        requests += 1
+        if len(str(params["message"])) > 256:
+            raise VkApiError(914, "message too long")
+        delivered.append(str(params["message"]))
+        return requests
+
+    original_mark = storage.mark_outbox
+
+    async def crash_before_dispatch(
+        row_id: int, state: str, *, message_id: str | None = None, error: str | None = None
+    ) -> None:
+        if state == "sending" and requests > 0 and len(delivered) == confirmed_replacements:
+            raise ProcessCrash
+        await original_mark(row_id, state, message_id=message_id, error=error)
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr(storage, "mark_outbox", crash_before_dispatch)
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    content = "a" * 512 + "b" * 512 + "c" * 76
+    try:
+        with pytest.raises(ProcessCrash):
+            await adapter.send("456", content)
+    finally:
+        await storage.close()
+
+    reopened = VkStorage(path)
+    await reopened.open()
+    adapter._storage = reopened
+    try:
+        pending = await reopened.prepared_outbox()
+        assert [len(row.wire_content) for row in pending] == [256, 256, 512, 76][confirmed_replacements:]
+        assert len({row.invocation_id for row in pending}) == 1
+        await adapter._recover_prepared_outbox()
+        assert "".join(delivered) == content
+        assert await reopened.prepared_outbox() == []
+        assert len(await reopened.diagnostic_rows(outbox_state="sent")) == 5
+        assert len(await reopened.diagnostic_rows(outbox_state="failed")) == 2
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_rechunking_preserves_one_logical_invocation(tmp_path: Path) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    delivered: list[str] = []
+
+    class LengthClient:
+        async def call(self, _method: str, params: dict[str, object]) -> int:
+            text = str(params["message"])
+            if len(text) > 256:
+                raise VkApiError(914, "message too long")
+            delivered.append(text)
+            return len(delivered)
+
+    adapter._storage = storage
+    adapter._client = cast("VkApiClient", LengthClient())
+    content = "a" * 512 + "b" * 512 + "c" * 76
+    try:
+        result = await adapter.send("456", content)
+        assert result.success
+        assert "".join(delivered) == content
+        rows = await storage.diagnostic_rows(outbox_state="sent")
+        assert len({row["invocation_id"] for row in rows}) == 1
+        assert sorted(int(cast("int", row["chunk_index"])) for row in rows) == list(range(5))
     finally:
         await storage.close()
 

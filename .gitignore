@@ -13,3 +13,4 @@ release-corpus/result.json
 .env
 .env.*
 !.env.example
+.hermes-agent/

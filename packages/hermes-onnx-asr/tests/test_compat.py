@@ -29,7 +29,7 @@ def test_requirement_check_accepts_certified_version_window(monkeypatch: pytest.
     monkeypatch.setattr(compat, "check_compatibility", lambda: (True, "ok"))
 
     def installed(package: str) -> str:
-        return {"onnx-asr": "0.12.4", "onnxruntime": "1.23.2"}[package]
+        return {"onnx-asr": "0.12.4", "onnxruntime": "1.30.0"}[package]
 
     monkeypatch.setattr(compat, "version", installed)
     assert compat.check_requirements()
@@ -39,7 +39,7 @@ def test_requirement_check_rejects_uncertified_new_versions(monkeypatch: pytest.
     monkeypatch.setattr(compat, "check_compatibility", lambda: (True, "ok"))
 
     def installed(package: str) -> str:
-        return {"onnx-asr": "0.13.0", "onnxruntime": "1.24.1"}[package]
+        return {"onnx-asr": "0.13.0", "onnxruntime": "1.31.0"}[package]
 
     monkeypatch.setattr(compat, "version", installed)
     assert not compat.check_requirements()
@@ -58,4 +58,23 @@ def test_requirement_check_rejects_missing_or_old_dependency(monkeypatch: pytest
         raise PackageNotFoundError
 
     monkeypatch.setattr(compat, "version", missing)
+    assert not compat.check_requirements()
+
+
+def test_compatibility_accepts_git_host_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    def installed(_package: str) -> str:
+        return "0.0.0"
+
+    monkeypatch.setattr(compat, "version", installed)
+    assert compat.check_compatibility()[0]
+
+
+@pytest.mark.parametrize("runtime", ["1.23.2", "1.24.1", "1.29.0", "1.31.0"])
+def test_requirement_check_rejects_runtime_outside_tested_range(monkeypatch: pytest.MonkeyPatch, runtime: str) -> None:
+    monkeypatch.setattr(compat, "check_compatibility", lambda: (True, "ok"))
+
+    def installed(package: str) -> str:
+        return "0.12.0" if package == "onnx-asr" else runtime
+
+    monkeypatch.setattr(compat, "version", installed)
     assert not compat.check_requirements()
