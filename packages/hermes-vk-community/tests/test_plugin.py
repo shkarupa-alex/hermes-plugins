@@ -35,7 +35,7 @@ def test_register_exposes_pinned_hermes_contract() -> None:
         assert "cron_deliver_env_var" not in context.platform
         assert "standalone_sender_fn" not in context.platform
     assert context.platform["required_env"] == ["VK_COMMUNITY_TOKEN"]
-    assert context.platform["max_message_length"] == 4096
+    assert context.platform["max_message_length"] == 0
     assert context.platform["allow_update_command"] is False
     assert callable(context.platform["apply_yaml_config_fn"])
     assert callable(context.platform["setup_fn"])

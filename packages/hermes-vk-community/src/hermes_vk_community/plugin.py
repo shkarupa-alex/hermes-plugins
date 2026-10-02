@@ -43,7 +43,10 @@ def register(ctx: PluginContext) -> None:
         **cron,
         required_env=["VK_COMMUNITY_TOKEN"],
         setup_fn=interactive_setup,
-        max_message_length=4096,
+        # The native adapter owns wire splitting and whole-report evidence.
+        # Host prechunking retains only the final standalone result, losing a
+        # delivered prefix or an earlier warning on long cron reports.
+        max_message_length=0,
         allow_update_command=False,
         pii_safe=True,
         emoji="💬",

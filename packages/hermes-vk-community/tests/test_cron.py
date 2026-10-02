@@ -493,6 +493,83 @@ def test_actual_scheduler_retains_standalone_partial_evidence_on_reconnect(
     assert delivery_client[-1] == "closed"
 
 
+@pytest.mark.skipif(not supports_cron_delivery(), reason="old-host VK cron is unsupported")
+@pytest.mark.parametrize("outcome", ["late_refusal", "early_refusal", "early_unknown", "success"])
+def test_actual_scheduler_preserves_complete_long_standalone_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery_client: list[str], outcome: str
+) -> None:
+    from cron import scheduler_delivery as delivery
+
+    from tools import send_message_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    config.extra["max_message_length"] = 4096 if outcome == "late_refusal" else 256
+    wire_calls: list[dict[str, object]] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        wire_calls.append(params)
+        if outcome == "early_unknown":
+            raise VkDeliveryUnknownError("lost first response")
+        if outcome in {"early_refusal", "late_refusal"} and len(wire_calls) == 2:
+            raise VkApiError(7, "denied")
+        return 42
+
+    def no_live(_platform: object) -> tuple[None, None]:
+        return None, None
+
+    def forbidden_queue(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("the complete long report was queued after partial or uncertain delivery")
+
+    def no_mirror(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr(send_message_tool, "_live_adapter", no_live)
+    monkeypatch.setattr(delivery, "_queue_for_live_reconnect", forbidden_queue)
+    monkeypatch.setattr(delivery, "_maybe_mirror_cron_delivery", no_mirror)
+    target = SimpleNamespace(
+        job={"id": "standalone-long"},
+        is_relay=False,
+        where="vk:456",
+        platform=Platform("vk"),
+        platform_name="vk",
+        pconfig=config,
+        chat_id="456",
+        thread_id=None,
+        mirror_text="",
+        live_error="send_path_degraded",
+        origin_user_id=None,
+        mirror_this_target=False,
+    )
+    errors: list[str] = []
+    content = "x" * 4500
+    cast("Any", delivery)._deliver_standalone(cast("Any", target), content, [], [], errors)
+    if outcome == "success":
+        assert errors == []
+        assert len(wire_calls) > 2
+        assert "".join(str(call["message"]) for call in wire_calls) == content
+    else:
+        assert any("delivery warning" in error for error in errors)
+        assert len(wire_calls) == (1 if outcome == "early_unknown" else 2)
+    # One sender owns the complete report, rather than a new sender per host chunk.
+    assert delivery_client == ["created", "opened", "verified", "closed"]
+
+    async def stored_invocations() -> set[object]:
+        storage = VkStorage(tmp_path / "state.sqlite3")
+        await storage.open(recover_inflight=False)
+        try:
+            rows: list[dict[str, object]] = []
+            for state in ("sent", "failed", "partial_delivery", "delivery_unknown"):
+                rows.extend(await storage.diagnostic_rows(outbox_state=state))
+            assert await storage.prepared_outbox() == []
+            return {row["invocation_id"] for row in rows}
+        finally:
+            await storage.close()
+
+    assert len(asyncio.run(stored_invocations())) == 1
+
+
 @pytest.mark.asyncio
 async def test_cancelled_outbox_recovery_terminalizes_its_remaining_invocation(
     tmp_path: Path,
