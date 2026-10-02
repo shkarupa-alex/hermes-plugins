@@ -21,7 +21,9 @@ def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract 
         installed = Version(version("hermes-agent"))
     except PackageNotFoundError:
         return False, "hermes-agent is not installed"
-    if installed < MIN_HERMES:
+    # Current Hermes checkouts use a 0.0.0 packaging placeholder. The API
+    # probes below still reject an incompatible host.
+    if installed != Version("0.0.0") and installed < MIN_HERMES:
         return False, f"hermes-agent {installed} is below the minimum supported version >=0.18.2"
     supports_draft_streaming_legacy = (
         ("self", 1, False),
@@ -132,6 +134,9 @@ def check_compatibility() -> tuple[bool, str]:  # noqa: PLR0911 - each contract 
         ("session_key", 1, False),
         ("description", 1, True),
         ("metadata", 1, True),
+        ("allow_permanent", 1, True),
+        ("allow_session", 1, True),
+        ("smart_denied", 1, True),
     )
     if _shape(VkCommunityAdapter.send_exec_approval) != exec_shape:
         return False, "VkCommunityAdapter.send_exec_approval signature drifted from gateway/run.py"

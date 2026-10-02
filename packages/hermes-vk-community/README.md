@@ -10,11 +10,15 @@ Community Long Poll API.
 
 Минимальная поддерживаемая версия Hermes: `>=0.18.2`. Совместимость с новыми версиями проверяется по API-контракту при загрузке плагина.
 
-Hermes `0.18.2` сам фиксирует `cryptography==46.0.7` и `Pillow==12.2.0`, для
-которых опубликованы advisory с исправлениями в `48.0.1` и `12.3.0`.
-До совместимого upstream-релиза supply-chain gate содержит только точечные
-исключения конкретных advisory ID; расширять версии на стороне плагина нельзя,
-поскольку это сделает dependency graph с Hermes `0.18.2` неразрешимым.
+Рабочее окружение и основной CI используют Python 3.14 и фиксированный Git SHA
+актуального Hermes. У Git-установок Hermes metadata-версия может быть `0.0.0`;
+в этом случае плагин проверяет совместимость по API-контракту. Старые релизы
+Hermes `0.18.2`, `0.19.0` и `0.21.5` проверяются отдельно на Python 3.11/3.13.
+
+Supply-chain gate проверяет все PyPI-зависимости lock-файла без исключений
+advisory. Сам Git checkout Hermes не сопоставляется с релизом PyPI. Только в
+окружении разработки обновлены upstream-пины PyJWT, Pydantic и packaging;
+установка плагина не меняет политику зависимостей рабочего Hermes.
 
 ## Быстрая настройка
 
@@ -146,10 +150,10 @@ platforms:
 Hermes как зависимость плагина:
 
 ```bash
-uv sync --all-packages
-uv run pytest packages/hermes-vk-community/tests
-uv run ruff check packages/hermes-vk-community
-uv run pyright packages/hermes-vk-community
+python3 tools/sync_workspace.py
+uv run --no-sync pytest packages/hermes-vk-community/tests
+uv run --no-sync ruff check packages/hermes-vk-community
+uv run --no-sync pyright packages/hermes-vk-community
 ```
 
 То есть тесты можно запускать до установки Hermes пользователем. Полностью без
@@ -242,3 +246,38 @@ identity сообщества, Community Long Poll, SQLite migration/schema, pla
 lock, formatting profile и media flow. Флаги `--inflight` и
 `--delivery-unknown` выводят только bounded идентификаторы и ошибки без текста
 сообщений и секретов.
+
+
+## Отчёты cron в VK
+
+VK зарегистрирован как штатная платформа доставки cron. В списке адресатов
+появляется `vk`, если плагин включён, а токен и `platforms.vk` настроены в
+активном профиле. Для конкретного адресата задайте `deliver="vk:456"`, где
+`456` — числовой ID разрешённого пользователя из `allowed_user_ids`.
+
+Чтобы использовать короткое `deliver="vk"`, отправьте боту `/sethome` в нужном
+личном диалоге или сохраните в `config.yaml`:
+
+```yaml
+platforms:
+  vk:
+    enabled: true
+    group_id: 123
+    allowed_user_ids: [456]
+    home_channel:
+      platform: vk
+      chat_id: "456"
+      name: "Отчёты VK"
+```
+
+Hermes также принимает `VK_HOME_CHANNEL=456` в `.env` этого профиля;
+переменная переопределяет адресата из YAML. В Hermes 0.18.2 домашний
+адресат cron читается только из этой переменной. `deliver="origin"` возвращает
+отчёт в исходный диалог VK, а `deliver="all"` включает настроенный домашний
+диалог VK. Бот должен иметь право писать пользователю; пользователь сначала
+открывает личный диалог с сообществом. Темы и групповые беседы не поддерживаются.
+
+Доставка из отдельного cron-процесса использует тот же Markdown-renderer,
+разбиение сообщений, отправку вложений и durable outbox, что и gateway.
+Она проверяет YAML-allowlist и не запускает второй Long Poll receiver.
+Токен берётся из secret scope активного профиля.

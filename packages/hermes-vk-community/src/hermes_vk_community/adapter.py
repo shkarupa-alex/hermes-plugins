@@ -173,6 +173,65 @@ class VkCommunityAdapter(BasePlatformAdapter):
         await self._stop_polling()
         await self._close_resources(release_lock=True)
 
+    async def send_once(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        media_files: list[tuple[str, bool]] | None = None,
+        force_document: bool = False,
+    ) -> dict[str, object]:
+        """Use the durable outbound pipeline without taking the receiver lock."""
+        if chat_id not in self._allow_from:
+            return {"error": "VK delivery target must be an allowed private-message user ID"}
+        token = get_secret("VK_COMMUNITY_TOKEN")
+        if not token:
+            return {"error": "VK_COMMUNITY_TOKEN is missing"}
+        if any(
+            not exists
+            for exists in await asyncio.gather(
+                *(asyncio.to_thread(Path(path).is_file) for path, _voice in media_files or [])
+            )
+        ):
+            return {"error": "VK delivery attachment was not found"}
+        try:
+            self._client = VkApiClient(token, api_version=self.settings.api_version, media=self.settings.media)
+            await self._client.open()
+            await self._verify_group()
+            self._storage = VkStorage(self.settings.resolve_storage_path(Path(get_hermes_home())))
+            await self._storage.open()
+            return await self._send_report(chat_id, content, media_files or [], force_document=force_document)
+        except VkApiError as exc:
+            return {"error": _safe_api_error(exc)}
+        except Exception as exc:  # noqa: BLE001 - do not expose credentials from transport exceptions
+            return {"error": f"VK report delivery failed: {type(exc).__name__}"}
+        finally:
+            await self._close_resources(release_lock=False)
+
+    async def _send_report(
+        self,
+        chat_id: str,
+        content: str,
+        media_files: list[tuple[str, bool]],
+        *,
+        force_document: bool,
+    ) -> dict[str, object]:
+        result = await self.send(chat_id, content) if content.strip() else None
+        if result is not None and (not result.success or _partial_delivery_payload(result) is not None):
+            return {"error": result.error or "VK report was only partially delivered"}
+        for path, voice in media_files or []:
+            if voice:
+                result = await self.send_voice(chat_id, path)
+            elif not force_document and await asyncio.to_thread(_sniff_mime, Path(path)) in {"image/jpeg", "image/png"}:
+                result = await self.send_image_file(chat_id, path)
+            else:
+                result = await self.send_document(chat_id, path)
+            if not result.success:
+                return {"error": result.error or "VK attachment delivery failed"}
+        if result is None:
+            return {"error": "VK report has no text or attachments"}
+        return {"success": True, "message_id": result.message_id, "media_delivered": bool(media_files)}
+
     async def send(
         self,
         chat_id: str,
@@ -615,7 +674,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         rendered = self._renderer.render_markdown(content)
         return any(not isinstance(segment, RenderedTextSegment) for segment in rendered.segments)
 
-    async def send_clarify(  # noqa: PLR0913 - exact Hermes compatibility contract
+    async def send_clarify(  # noqa: PLR0913, PLR0917 - exact Hermes compatibility contract
         self,
         chat_id: str,
         question: str,
@@ -637,25 +696,37 @@ class VkCommunityAdapter(BasePlatformAdapter):
         body = "❓ " + question + "\n\n" + "\n".join(f"{index + 1}. {value}" for index, value in enumerate(values))
         return await self._send_keyboard(chat_id, body, buttons, session_key, metadata)
 
-    async def send_exec_approval(
+    @classmethod
+    def supports_exec_approval_buttons(cls) -> bool:
+        return True
+
+    async def send_exec_approval(  # noqa: PLR0913, PLR0917 - exact Hermes approval contract
         self,
         chat_id: str,
         command: str,
         session_key: str,
-        description: str = "dangerous command",
+        description: str | None = None,
         metadata: dict[str, Any] | None = None,
+        allow_permanent: bool = True,  # noqa: FBT001, FBT002 - Hermes contract
+        allow_session: bool = True,  # noqa: FBT001, FBT002 - Hermes contract
+        smart_denied: bool = False,  # noqa: FBT001, FBT002 - Hermes contract
     ) -> SendResult:
+        # VK offers only a one-time approval, even when Hermes permits broader grants.
+        del allow_permanent, allow_session
         preview = command if len(command) <= MAX_APPROVAL_PREVIEW else command[:MAX_APPROVAL_PREVIEW] + "..."
-        body = f"⚠️ Требуется подтверждение команды\n\n{preview}\n\nПричина: {description}"  # noqa: RUF001
+        reason = description or "dangerous command"
+        if smart_denied:
+            reason += " (smart approval denied; only a one-time override is available)"
+        body = f"⚠️ Требуется подтверждение команды\n\n{preview}\n\nПричина: {reason}"  # noqa: RUF001
         return await self._send_keyboard(
             chat_id,
             body,
-            [("Разрешить", "approval", "approve", ""), ("Запретить", "approval", "deny", "")],
+            [("Разрешить один раз", "approval", "once", ""), ("Запретить", "approval", "deny", "")],
             session_key,
             metadata,
         )
 
-    async def send_slash_confirm(  # noqa: PLR0913 - exact Hermes compatibility contract
+    async def send_slash_confirm(  # noqa: PLR0913, PLR0917 - exact Hermes compatibility contract
         self,
         chat_id: str,
         title: str,
@@ -757,7 +828,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"VK photo upload failed: {type(exc).__name__}", retryable=False)
         return await self._send_direct(int(chat_id), caption or "", reply_to=reply_to, attachment=attachment)
 
-    async def send_document(  # noqa: PLR0913 - exact Hermes compatibility contract
+    async def send_document(  # noqa: PLR0913, PLR0917 - exact Hermes compatibility contract
         self,
         chat_id: str,
         file_path: str,

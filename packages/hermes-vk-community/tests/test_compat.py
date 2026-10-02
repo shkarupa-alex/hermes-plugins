@@ -42,3 +42,11 @@ def test_compatibility_accepts_hermes_0206_draft_streaming_contract(monkeypatch:
     compatible, message = compat.check_compatibility()
     assert compatible
     assert message == "Hermes 0.20.6 contract is compatible"
+
+
+def test_compatibility_accepts_git_host_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    def installed(_package: str) -> str:
+        return "0.0.0"
+
+    monkeypatch.setattr(compat, "version", installed)
+    assert compat.check_compatibility()[0]

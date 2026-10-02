@@ -37,6 +37,8 @@ def register(ctx: PluginContext) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         apply_yaml_config_fn=apply_yaml_config,
+        cron_deliver_env_var="VK_HOME_CHANNEL",
+        standalone_sender_fn=send_standalone,
         required_env=["VK_COMMUNITY_TOKEN"],
         setup_fn=interactive_setup,
         max_message_length=4096,
@@ -55,3 +57,21 @@ def register(ctx: PluginContext) -> None:
         setup_fn=setup_parser,
         handler_fn=handle_command,
     )
+
+
+async def send_standalone(  # noqa: PLR0913 - exact Hermes standalone sender contract
+    config: PlatformConfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: str | None = None,
+    media_files: list[tuple[str, bool]] | None = None,
+    force_document: bool = False,
+) -> dict[str, object]:
+    """Deliver a cron report without starting a second Long Poll receiver."""
+    if thread_id:
+        return {"error": "VK private messages do not support threads"}
+    if not config.enabled or not validate_config(config):
+        return {"error": "VK configuration is disabled or invalid"}
+    adapter = build_adapter(config)
+    return await adapter.send_once(chat_id, message, media_files=media_files, force_document=force_document)

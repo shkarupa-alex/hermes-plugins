@@ -199,7 +199,7 @@ def _paginate(header_height: int, row_heights: list[int]) -> list[tuple[int, int
     return pages
 
 
-def _draw_row(  # noqa: PLR0913 - drawing requires explicit geometry and style inputs
+def _draw_row(  # noqa: PLR0913, PLR0917 - drawing requires explicit geometry and style inputs
     image: Image.Image,
     draw: ImageDraw.ImageDraw,
     cells: list[list[str]],

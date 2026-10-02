@@ -27,6 +27,8 @@ def test_register_exposes_pinned_hermes_contract() -> None:
     context = ContextRecorder()
     register(context)
     assert context.platform["name"] == "vk"
+    assert context.platform["cron_deliver_env_var"] == "VK_HOME_CHANNEL"
+    assert callable(context.platform["standalone_sender_fn"])
     assert context.platform["required_env"] == ["VK_COMMUNITY_TOKEN"]
     assert context.platform["max_message_length"] == 4096
     assert context.platform["allow_update_command"] is False

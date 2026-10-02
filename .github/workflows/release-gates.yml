@@ -24,6 +24,8 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.14"
       - name: Verify plugin release metadata
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -36,31 +38,10 @@ jobs:
           fi
       - name: Audit locked production dependencies
         run: |
-          uv export --all-packages --locked --no-dev --no-emit-workspace --output-file requirements-audit.txt
-          # hermes-agent 0.18.2 pins these exact vulnerable versions and is
-          # itself associated with two upstream-only advisories. Keep the
-          # exceptions narrow and remove them as soon as upstream publishes a
-          # compatible release with cryptography>=50.0.0 and Pillow>=12.3.0.
-          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip \
-            --ignore-vuln GHSA-537c-gmf6-5ccf \
-            --ignore-vuln PYSEC-2026-2253 \
-            --ignore-vuln PYSEC-2026-2254 \
-            --ignore-vuln PYSEC-2026-2255 \
-            --ignore-vuln PYSEC-2026-2256 \
-            --ignore-vuln PYSEC-2026-2257 \
-            --ignore-vuln PYSEC-2026-3451 \
-            --ignore-vuln PYSEC-2026-3452 \
-            --ignore-vuln PYSEC-2026-3453 \
-            --ignore-vuln PYSEC-2026-3454 \
-            --ignore-vuln PYSEC-2026-3493 \
-            --ignore-vuln PYSEC-2026-3494 \
-            --ignore-vuln PYSEC-2026-3495 \
-            --ignore-vuln PYSEC-2026-3496 \
-            --ignore-vuln PYSEC-2026-3552 \
-            --ignore-vuln PYSEC-2026-3553 \
-            --ignore-vuln PYSEC-2026-3554 \
-            --ignore-vuln CVE-2026-10221 \
-            --ignore-vuln CVE-2026-10224
+          uv export --all-packages --locked --no-dev --no-emit-workspace --no-emit-package hermes-agent --output-file requirements-audit.txt
+          # The frozen Git host has 0.0.0 placeholder metadata, which pip-audit
+          # cannot match to a release advisory. Audit every registry dependency.
+          uv tool run pip-audit --requirement requirements-audit.txt --no-deps --disable-pip
       - name: Scan repository history for secrets
         uses: gitleaks/gitleaks-action@v3
         env:
@@ -70,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2022, macos-15-intel, macos-15]
+        os: [ubuntu-latest, windows-2022, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -78,8 +59,9 @@ jobs:
           ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v10.1.0
         with:
+          python-version: "3.14"
           enable-cache: true
-      - run: uv sync --all-packages --locked
+      - run: python tools/sync_workspace.py
       - name: Configure isolated Hermes profile
         shell: bash
         run: |
@@ -87,14 +69,14 @@ jobs:
           mkdir -p "$profile_root"
           printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: gigaam-v3-e2e-rnnt\n    quantization: int8\n    model_dir: "%s/models/onnx-asr"\n' "$profile_root" > "$profile_root/config.yaml"
           echo "HERMES_HOME=$profile_root" >> "$GITHUB_ENV"
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr doctor
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr doctor
       - name: Prove runtime is offline
         shell: bash
         run: |
           export HERMES_ASR_RELEASE_MODEL_DIR="$HERMES_HOME/models/onnx-asr"
-          uv run pytest -q -m asr_live integration-tests/test_asr_offline_runtime.py
+          uv run --no-sync pytest -q -m asr_live integration-tests/test_asr_offline_runtime.py
 
   asr-corpus:
     runs-on: ubuntu-latest
@@ -103,7 +85,9 @@ jobs:
         with:
           ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v10.1.0
-      - run: uv sync --all-packages --locked
+        with:
+          python-version: "3.14"
+      - run: python tools/sync_workspace.py
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install --yes ffmpeg
       - name: Configure and fetch the pinned default pipeline
@@ -115,9 +99,9 @@ jobs:
       - name: Require versioned Russian corpus artifact
         run: test -f release-corpus/manifest.jsonl
       - run: test -f release-corpus/baseline.json
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
-      - run: uv run python tools/asr_corpus_gate.py release-corpus/manifest.jsonl --baseline release-corpus/baseline.json --output release-corpus/result.json
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr fetch gigaam-v3-e2e-rnnt --quantization int8
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr fetch-vad silero
+      - run: uv run --no-sync python tools/asr_corpus_gate.py release-corpus/manifest.jsonl --baseline release-corpus/baseline.json --output release-corpus/result.json
       - name: Preserve corpus metrics
         if: ${{ always() && hashFiles('release-corpus/result.json') != '' }}
         uses: actions/upload-artifact@v7.0.1
@@ -135,15 +119,17 @@ jobs:
         with:
           ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v10.1.0
-      - run: uv sync --all-packages --locked
+        with:
+          python-version: "3.14"
+      - run: python tools/sync_workspace.py
       - name: Configure model profile
         run: |
           profile_root="${RUNNER_TEMP//\\//}/hermes-profile"
           mkdir -p "$profile_root"
           printf 'plugins:\n  enabled: [onnx-asr]\nstt:\n  provider: onnx_asr\n  onnx_asr:\n    model: %s\n    quantization: %s\n    model_dir: "%s/models/onnx-asr"\n    vad:\n      min_audio_seconds: null\n' "$ASR_MODEL" "$ASR_QUANTIZATION" "$profile_root" > "$profile_root/config.yaml"
           echo "HERMES_HOME=$profile_root" >> "$GITHUB_ENV"
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr fetch "$ASR_MODEL" --quantization "$ASR_QUANTIZATION"
-      - run: uv run --package hermes-onnx-asr hermes onnx-asr warmup
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr fetch "$ASR_MODEL" --quantization "$ASR_QUANTIZATION"
+      - run: uv run --no-sync --package hermes-onnx-asr hermes onnx-asr warmup
 
   vk-live:
     runs-on: ubuntu-latest
@@ -156,8 +142,10 @@ jobs:
         with:
           ref: ${{ inputs.release_ref || github.ref }}
       - uses: astral-sh/setup-uv@v10.1.0
-      - run: uv sync --all-packages --locked
+        with:
+          python-version: "3.14"
+      - run: python tools/sync_workspace.py
       - name: Require private VK release-test credentials
         shell: bash
         run: test -n "$VK_COMMUNITY_TOKEN" && test -n "$VK_GROUP_ID" && test -n "$VK_TEST_PEER_ID"
-      - run: uv run pytest -q -m vk_live
+      - run: uv run --no-sync pytest -q -m vk_live
