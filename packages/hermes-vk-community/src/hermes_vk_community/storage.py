@@ -499,17 +499,16 @@ class VkStorage:
                 "UPDATE outbox SET state=?,error=?,updated_at_ms=? WHERE id=?",
                 (state, (error or "delivery failed")[:2048], now, record.id),
             )
-            if tail_records:
-                placeholders = ",".join("?" for _ in tail_records)
-                await db.execute(
-                    f"UPDATE outbox SET state='failed',error=?,updated_at_ms=? "  # noqa: S608 - IDs use placeholders
-                    f"WHERE state='prepared' AND id IN ({placeholders})",
-                    (
-                        (tail_error or "unsent tail is terminal")[:2048],
-                        now,
-                        *(item.id for item in tail_records),
-                    ),
-                )
+            # A rechunk transaction may have committed new records before its
+            # caller was cancelled. Include the durable invocation, rather than
+            # relying only on the caller's earlier in-memory snapshot.
+            tail_ids = [record.id, *(item.id for item in tail_records)]
+            placeholders = ",".join("?" for _ in tail_ids)
+            await db.execute(
+                f"UPDATE outbox SET state='failed',error=?,updated_at_ms=? "  # noqa: S608 - IDs use placeholders
+                f"WHERE state='prepared' AND (invocation_id=? OR id IN ({placeholders}))",
+                ((tail_error or "unsent tail is terminal")[:2048], now, record.invocation_id, *tail_ids),
+            )
 
     async def counts(self) -> dict[str, int]:
         async with self._lock:

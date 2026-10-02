@@ -112,6 +112,33 @@ jobs:
           "pytest>=9.1.1" "pytest-asyncio>=1.4.0" "jiwer==4.0.0"
       - run: .venv/bin/python -m pytest -q
 
+  hermes-trace-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.14"
+      - run: python tools/sync_workspace.py
+      - name: Resolve the frozen host's trace-upload extra with both plugins
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+          config = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "host-overrides.txt"
+          path.write_text("\n".join(config["tool"]["uv"]["override-dependencies"]) + "\n")
+          PY
+          uv pip install --no-sources --overrides "$RUNNER_TEMP/host-overrides.txt" \
+            --editable '.hermes-agent[trace-upload]' \
+            --editable packages/hermes-vk-community --editable packages/hermes-onnx-asr
+      - run: uv run --no-sync pytest -q
+      - name: Audit the resolved extra's registry dependencies
+        run: |
+          uv pip freeze --exclude-editable > requirements-trace-audit.txt
+          uv tool run pip-audit --requirement requirements-trace-audit.txt --no-deps --disable-pip
+
   hermes-main:
     runs-on: ubuntu-latest
     steps:

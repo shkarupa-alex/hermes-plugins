@@ -16,6 +16,14 @@ Windows x86-64/ARM64 и macOS Apple Silicon (macOS 14+). ONNX Runtime 1.30
 в этом случае плагин проверяет совместимость по API-контракту. Старые релизы
 Hermes `0.18.2`, `0.19.0` и `0.21.5` проверяются отдельно на Python 3.11/3.13.
 
+Для версионированных релизов runtime отклоняет Hermes ниже `0.18.2`.
+Широкая package-зависимость `hermes-agent>=0` нужна для Git-host с metadata
+`0.0.0`: обязательную проверку версии и API выполняет compatibility gate.
+
+Hugging Face Hub `1.24.0` поддерживается вместе с Hermes extra `trace-upload`,
+который фиксирует эту версию. Обычный workspace использует Hub `2.1.1`;
+оба варианта проходят отдельные проверки CI.
+
 Supply-chain gate проверяет все PyPI-зависимости lock-файла без исключений
 advisory. Сам Git checkout Hermes не сопоставляется с релизом PyPI. Только в
 окружении разработки обновлены upstream-пины PyJWT, Pydantic и packaging;

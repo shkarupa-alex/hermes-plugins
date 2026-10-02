@@ -1,5 +1,6 @@
 # pyright: reportPrivateUsage=false
 from __future__ import annotations
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -19,7 +20,7 @@ from hermes_vk_community.adapter import (
     _is_retryable_send_error,
     _source_prefix_for_rendered,
 )
-from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkLongPollProtocolError
+from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import InteractionPayload, LongPollLease, LongPollResponse, VkAttachment, VkMessage
 from hermes_vk_community.plugin import build_adapter
 from hermes_vk_community.renderer import RenderedTableSegment, RenderedTextSegment, RichVkRenderer
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from hermes_vk_community.client import VkApiClient
-    from hermes_vk_community.storage import InboxState
+    from hermes_vk_community.storage import InboxState, OutboxRecord
 
 
 class StorageSpy:
@@ -305,6 +306,182 @@ async def test_voice_attachment_reaches_stt_without_cached_file_note(
     assert media_types == ["audio/ogg"]
     assert is_voice
     assert text == ""
+
+
+@pytest.mark.asyncio
+async def test_chat_send_retries_after_adapter_reconnects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _adapter()
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    calls: list[object] = []
+
+    class Client:
+        async def call(self, _method: str, params: dict[str, object]) -> int:
+            calls.append(params)
+            return 42
+
+    async def reconnect(_delay: float) -> None:
+        adapter._client = cast("VkApiClient", Client())
+
+    adapter._storage = storage
+    monkeypatch.setattr("hermes_vk_community.adapter.asyncio.sleep", reconnect)
+    try:
+        result = await adapter._send_with_retry("456", "reply", base_delay=0)
+        assert result.success
+        assert len(calls) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_permanent_target_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _adapter()
+    original = adapter.send
+    calls: list[str] = []
+
+    async def send(chat_id: str, content: str, **_kwargs: object) -> SendResult:
+        calls.append(content)
+        return await original(chat_id, content)
+
+    monkeypatch.setattr(adapter, "send", send)
+    result = await adapter._send_with_retry("999", "reply")
+    assert not result.success
+    assert result.error_kind == "forbidden"
+    assert calls == ["reply"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 503])
+async def test_transient_http_send_reuses_the_persisted_random_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    from tenacity import wait_none
+
+    adapter = _adapter()
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    random_ids: list[object] = []
+
+    class Client:
+        async def call(self, _method: str, params: dict[str, object]) -> int:
+            random_ids.append(params["random_id"])
+            if len(random_ids) < 3:
+                raise VkHttpError(status, "API")
+            return 42
+
+    def no_wait(**_kwargs: object) -> wait_none:
+        return wait_none()
+
+    monkeypatch.setattr("hermes_vk_community.adapter.wait_random_exponential", no_wait)
+    adapter._storage = storage
+    adapter._client = cast("VkApiClient", Client())
+    try:
+        result = await adapter._send_with_retry("456", "reply")
+        assert result.success
+        assert len(random_ids) == 3
+        assert len(set(random_ids)) == 1
+        assert len(await storage.diagnostic_rows(outbox_state="sent")) == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "recovery"])
+@pytest.mark.parametrize("failure", ["before", "after_commit", "cancel_before", "cancel_after_commit"])
+async def test_rechunk_failure_terminalizes_all_durable_replacements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, failure: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 512
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    original_rechunk = adapter._rechunk_rejected
+
+    async def broken_rechunk(record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]]:
+        if "after_commit" in failure:
+            await original_rechunk(record)
+        if failure.startswith("cancel"):
+            raise asyncio.CancelledError
+        raise OSError("rechunk failed")
+
+    async def too_long(_self: VkCommunityAdapter, _params: dict[str, object]) -> object:
+        raise VkApiError(914, "too long")
+
+    monkeypatch.setattr(adapter, "_rechunk_rejected", broken_rechunk)
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", too_long)
+    try:
+        if lane == "recovery":
+            await storage.prepare_outbox(456, ["x" * 512, "tail 1", "tail 2"], None)
+            operation = adapter._recover_prepared_outbox()
+        else:
+            operation = adapter._send_with_retry("456", "x" * 1100, base_delay=0)
+        if failure.startswith("cancel"):
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        else:
+            result = await operation
+            if lane == "send":
+                assert isinstance(result, SendResult)
+                assert not result.success
+                assert result.error_kind == "internal"
+        await storage.close()
+        await storage.open()
+        assert await storage.prepared_outbox() == []
+        assert (await storage.counts())["outbox_delivery_unknown"] == 0
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == (5 if "after_commit" in failure else 3)
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "direct", "recovery"])
+async def test_cancellation_before_dispatch_is_not_delivery_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    started = asyncio.Event()
+    original_mark = storage.mark_outbox
+
+    async def blocked_mark(row_id: int, state: str, **kwargs: Any) -> None:  # noqa: ANN401 - adapter write contract
+        if state == "sending":
+            started.set()
+            await asyncio.Event().wait()
+        await original_mark(row_id, state, **kwargs)
+
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("cancelled request reached the transport")
+
+    monkeypatch.setattr(storage, "mark_outbox", blocked_mark)
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", forbidden)
+    if lane == "send":
+        operation = adapter.send("456", "x" * 600)
+    elif lane == "direct":
+        operation = adapter._send_direct(456, "caption")
+    else:
+        await storage.prepare_outbox(456, ["head", "tail 1", "tail 2"], None)
+        operation = adapter._recover_prepared_outbox()
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert (await storage.counts())["outbox_delivery_unknown"] == 0
+        assert await storage.prepared_outbox() == []
+        rows = await storage.diagnostic_rows(outbox_state="failed")
+        assert len(rows) == (1 if lane == "direct" else 3)
+        assert "before dispatch" in str(rows[0]["error"])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await storage.close()
 
 
 @pytest.mark.asyncio

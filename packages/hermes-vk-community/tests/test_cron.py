@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import threading
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -405,7 +406,7 @@ async def test_cancelled_standalone_cannot_recover_an_orphan_tail(
 
 
 @pytest.mark.asyncio
-async def test_standalone_does_not_report_partial_delivery_as_success(
+async def test_standalone_reports_partial_delivery_without_scheduling_a_duplicate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     delivery_client: list[str],
@@ -414,7 +415,81 @@ async def test_standalone_does_not_report_partial_delivery_as_success(
         return SendResult(success=True, message_id="42", raw_response={"partial_delivery": {"failed_segment": "text"}})
 
     monkeypatch.setattr(VkCommunityAdapter, "send", partial)
-    assert "error" in await send_standalone(_config(tmp_path), "456", "Отчёт")
+    result = await send_standalone(_config(tmp_path), "456", "Отчёт")
+    assert result["success"] is True
+    assert result["message_id"] == "42"
+    assert result["warnings"]
+    assert "error" not in result
+    assert delivery_client[-1] == "closed"
+
+
+@pytest.mark.skipif(not supports_cron_delivery(), reason="old-host VK cron is unsupported")
+@pytest.mark.parametrize("failure", ["attachment_result", "attachment_exception", "unknown_text", "partial_text"])
+def test_actual_scheduler_retains_standalone_partial_evidence_on_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery_client: list[str], failure: str
+) -> None:
+    from cron import scheduler_delivery as delivery
+
+    from tools import send_message_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    config.extra["max_message_length"] = 256
+    report = tmp_path / "report.csv"
+    report.write_text("name,value\na,1\n")
+    wire_calls: list[dict[str, object]] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        wire_calls.append(params)
+        if failure == "unknown_text":
+            raise VkDeliveryUnknownError("lost response")
+        if failure == "partial_text" and len(wire_calls) == 2:
+            raise VkApiError(7, "denied")
+        return 42
+
+    async def document(_self: VkCommunityAdapter, *_args: object, **_kwargs: object) -> SendResult:
+        if failure == "attachment_exception":
+            raise OSError("upload failed")
+        return SendResult(success=False, error="upload failed", retryable=False)
+
+    def no_live(_platform: object) -> tuple[None, None]:
+        return None, None
+
+    def forbidden_queue(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("partially visible standalone text was queued for whole-message redelivery")
+
+    def no_mirror(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    monkeypatch.setattr(VkCommunityAdapter, "send_document", document)
+    monkeypatch.setattr(send_message_tool, "_live_adapter", no_live)
+    monkeypatch.setattr(delivery, "_queue_for_live_reconnect", forbidden_queue)
+    monkeypatch.setattr(delivery, "_maybe_mirror_cron_delivery", no_mirror)
+    target = SimpleNamespace(
+        job={"id": "standalone-partial"},
+        is_relay=False,
+        where="vk:456",
+        platform=Platform("vk"),
+        platform_name="vk",
+        pconfig=config,
+        chat_id="456",
+        thread_id=None,
+        mirror_text="",
+        live_error="send_path_degraded",
+        origin_user_id=None,
+        mirror_this_target=False,
+    )
+    errors: list[str] = []
+    cast("Any", delivery)._deliver_standalone(
+        cast("Any", target),
+        "x" * 600 if failure == "partial_text" else "report",
+        [(str(report), False)],
+        [],
+        errors,
+    )
+    assert any("delivery warning" in error for error in errors)
+    assert len(wire_calls) == (2 if failure == "partial_text" else 1)
     assert delivery_client[-1] == "closed"
 
 

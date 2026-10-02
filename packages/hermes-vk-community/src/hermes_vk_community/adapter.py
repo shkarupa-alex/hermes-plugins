@@ -187,7 +187,12 @@ class VkCommunityAdapter(BasePlatformAdapter):
         # Cron can bypass send_once through a live gateway adapter. Apply the
         # same static/pairing policy as inbound messages, before content I/O.
         if any((metadata or {}).get(key) for key in THREAD_ROUTING_KEYS):
-            return SendResult(success=False, error="VK private messages do not support threads", retryable=False)
+            return SendResult(
+                success=False,
+                error="VK private messages do not support threads",
+                retryable=False,
+                error_kind="invalid_target",
+            )
         user_id = _private_delivery_user_id(chat_id)
         if user_id is not None:
             if chat_id in self._allow_from:
@@ -198,6 +203,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             success=False,
             error="VK delivery target must be an allowed private-message user ID",
             retryable=False,
+            error_kind="forbidden",
         )
 
     async def send_once(
@@ -254,17 +260,33 @@ class VkCommunityAdapter(BasePlatformAdapter):
         force_document: bool,
     ) -> dict[str, object]:
         result = await self.send(chat_id, content) if content.strip() else None
+        delivered = _send_result_ids(result) if result is not None else []
         if result is not None and (not result.success or _partial_delivery_payload(result) is not None):
-            return {"error": result.error or "VK report was only partially delivered"}
+            return _standalone_failure(
+                result.error or "VK report was only partially delivered",
+                delivered,
+                uncertain=_may_have_delivered(result) and not _send_result_ids(result),
+            )
         for path, voice in media_files or []:
-            if voice:
-                result = await self.send_voice(chat_id, path)
-            elif not force_document and await asyncio.to_thread(_sniff_mime, Path(path)) in {"image/jpeg", "image/png"}:
-                result = await self.send_image_file(chat_id, path)
-            else:
-                result = await self.send_document(chat_id, path)
-            if not result.success:
-                return {"error": result.error or "VK attachment delivery failed"}
+            try:
+                if voice:
+                    result = await self.send_voice(chat_id, path)
+                elif not force_document and await asyncio.to_thread(_sniff_mime, Path(path)) in {
+                    "image/jpeg",
+                    "image/png",
+                }:
+                    result = await self.send_image_file(chat_id, path)
+                else:
+                    result = await self.send_document(chat_id, path)
+            except Exception as exc:  # noqa: BLE001 - retain the already-visible text on upload failures
+                return _standalone_failure(f"VK attachment delivery failed: {type(exc).__name__}", delivered)
+            delivered.extend(_send_result_ids(result))
+            if not result.success or _partial_delivery_payload(result) is not None:
+                return _standalone_failure(
+                    result.error or "VK attachment delivery failed",
+                    delivered,
+                    uncertain=_may_have_delivered(result) and not _send_result_ids(result),
+                )
         if result is None:
             return {"error": "VK report has no text or attachments"}
         return {"success": True, "message_id": result.message_id, "media_delivered": bool(media_files)}
@@ -325,13 +347,22 @@ class VkCommunityAdapter(BasePlatformAdapter):
         base_delay: float = 2.0,
     ) -> SendResult:
         if not hasattr(BasePlatformAdapter, "_is_partial_delivery"):
-            # Older Hermes retries/falls back with the whole message even after
-            # a partial or ambiguous send. VK already retries safe API refusals
-            # per chunk; preserve its durable result without resending the head.
-            return await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            # Legacy whole-message fallback cannot preserve a visible prefix.
+            # Retry only explicit refusals and failures before network dispatch.
+            result = await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            for attempt in range(max_retries):
+                if result.success or self._send_retry_is_final(result) or not result.retryable:
+                    return result
+                delay = result.retry_after if result.retry_after is not None else base_delay * (2**attempt)
+                await asyncio.sleep(delay)
+                result = await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            return result
         return await super()._send_with_retry(
             chat_id, content, reply_to=reply_to, metadata=metadata, max_retries=max_retries, base_delay=base_delay
         )
+
+    def _send_retry_is_final(self, result: SendResult) -> bool:
+        return _may_have_delivered(result) or (result.error_kind is not None and not result.retryable)
 
     async def _send_text_segment(  # noqa: C901, PLR0911 - durable delivery has explicit failure/cancellation states
         self,
@@ -353,8 +384,10 @@ class VkCommunityAdapter(BasePlatformAdapter):
         index = 0
         while index < len(pending):
             chunk, chunk_format, record, chunk_start, _chunk_end = pending[index]
+            dispatched = False
             try:
                 await self._storage.mark_outbox(record.id, "sending")
+                dispatched = True
                 response = await self._send_chunk(
                     {
                         "peer_id": peer_id,
@@ -372,8 +405,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 await self._storage.terminalize_outbox_failure(
                     record,
-                    "delivery_unknown",
-                    "send cancelled after dispatch",
+                    "delivery_unknown" if dispatched else "failed",
+                    "send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
                     [item[2] for item in pending[index + 1 :]],
                     "blocked after cancelled earlier chunk",
                 )
@@ -395,7 +428,18 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 return _delivery_unknown_result("VK delivery timed out after the request may have succeeded", record.id)
             except VkApiError as exc:
                 if exc.code == VK_TOO_LONG_ERROR and len(chunk) > MIN_MESSAGE_LIMIT:
-                    replacement = await self._rechunk_rejected(record)
+                    replacement = await self._try_rechunk_rejected(record)
+                    if replacement is None:
+                        if delivered:
+                            return _partial_result(
+                                delivered, [item[0] for item in pending], delivered_characters=pending[index - 1][4]
+                            )
+                        return SendResult(
+                            success=False,
+                            error="VK could not rechunk a rejected message",
+                            retryable=False,
+                            error_kind="internal",
+                        )
                     pending[index : index + 1] = [
                         (
                             replacement_record.wire_content,
@@ -499,9 +543,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 recoverable=recoverable,
             )
         )[0]
+        dispatched = False
         try:
             if recoverable:
                 await self._storage.mark_outbox(record.id, "sending")
+            dispatched = True
             payload = await self._send_chunk(
                 {
                     "peer_id": peer_id,
@@ -518,7 +564,11 @@ class VkCommunityAdapter(BasePlatformAdapter):
             await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             return SendResult(success=True, message_id=message_id, retryable=False)
         except asyncio.CancelledError:
-            await self._storage.mark_outbox(record.id, "delivery_unknown", error="send cancelled after dispatch")
+            await self._storage.mark_outbox(
+                record.id,
+                "delivery_unknown" if dispatched else "failed",
+                error="send cancelled after dispatch" if dispatched else "send cancelled before dispatch",
+            )
             raise
         except VkDeliveryUnknownError:
             await self._storage.mark_outbox(record.id, "delivery_unknown", error="request timed out")
@@ -544,6 +594,31 @@ class VkCommunityAdapter(BasePlatformAdapter):
         )
         return [(item, span.start, span.end) for item, span in zip(replacement, spans, strict=True)]
 
+    async def _try_rechunk_rejected(self, record: OutboxRecord) -> list[tuple[OutboxRecord, int, int]] | None:
+        if self._storage is None:
+            raise RuntimeError("VK storage is not connected")
+        try:
+            return await self._rechunk_rejected(record)
+        except asyncio.CancelledError:
+            await self._storage.terminalize_outbox_failure(
+                record,
+                "failed",
+                "rechunk cancelled after known size refusal",
+                [],
+                "blocked after cancelled rechunk",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - preserve the known refusal and terminalize every durable tail
+            await self._storage.terminalize_outbox_failure(
+                record,
+                "failed",
+                f"rechunk failed: {type(exc).__name__}",
+                [],
+                "blocked after failed rechunk",
+            )
+            logger.warning("[vk] could not rechunk a rejected message: %s", type(exc).__name__)
+            return None
+
     async def _recover_prepared_outbox(self) -> None:
         if self._client is None or self._storage is None:
             return
@@ -555,8 +630,10 @@ class VkCommunityAdapter(BasePlatformAdapter):
             if record.invocation_id in blocked_invocations:
                 record_index += 1
                 continue
+            dispatched = False
             try:
                 await self._storage.mark_outbox(record.id, "sending")
+                dispatched = True
                 response = await self._send_chunk(
                     {
                         "peer_id": record.peer_id,
@@ -572,8 +649,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 await self._storage.terminalize_outbox_failure(
                     record,
-                    "delivery_unknown",
-                    "recovery cancelled after dispatch",
+                    "delivery_unknown" if dispatched else "failed",
+                    "recovery cancelled after dispatch" if dispatched else "recovery cancelled before dispatch",
                     [item for item in records[record_index + 1 :] if item.invocation_id == record.invocation_id],
                     "blocked after cancelled recovery chunk",
                 )
@@ -593,8 +670,12 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     and exc.code == VK_TOO_LONG_ERROR
                     and len(record.wire_content) > MIN_MESSAGE_LIMIT
                 ):
-                    replacement = await self._rechunk_rejected(record)
-                    records[record_index : record_index + 1] = [item for item, _start, _end in replacement]
+                    replacement = await self._try_rechunk_rejected(record)
+                    if replacement is not None:
+                        records[record_index : record_index + 1] = [item for item, _start, _end in replacement]
+                        continue
+                    blocked_invocations.add(record.invocation_id)
+                    record_index += 1
                     continue
                 await self._storage.terminalize_outbox_failure(
                     record,
@@ -1450,6 +1531,30 @@ def _delivery_unknown_result(error: str, outbox_id: int) -> SendResult:
     )
 
 
+def _may_have_delivered(result: SendResult) -> bool:
+    raw = cast("dict[str, object] | None", result.raw_response)
+    if not isinstance(raw, dict):
+        return False
+    return bool(raw.get("partial_overflow") or raw.get("partial_delivery") or raw.get("delivery_unknown"))
+
+
+def _standalone_failure(error: str, delivered: list[str], *, uncertain: bool = False) -> dict[str, object]:
+    if not delivered and not uncertain:
+        return {"error": error}
+    # Hermes queues an error-only standalone result for whole-text redelivery.
+    # Its documented partial-media contract acknowledges text and surfaces
+    # warnings as job failures, without scheduling a duplicate after reconnect.
+    return {
+        "success": True,
+        "message_id": delivered[-1] if delivered else None,
+        "warnings": [error],
+        "media_delivered": False,
+        "partial_delivery": True,
+        "delivery_unknown": uncertain,
+        "delivered_chunks": len(delivered),
+    }
+
+
 def _partial_send_result(delivered: list[str], partial: dict[str, object]) -> SendResult:
     # Old hosts resend the entire payload after any failure. Keep their original
     # visible-prefix result for ordinary chat; VK cron is unsupported there.
@@ -1609,6 +1714,10 @@ def _raise_polling_resources_missing() -> Never:
 
 
 def _is_retryable_send_error(exc: BaseException) -> bool:
+    if isinstance(exc, VkHttpError):
+        # Retry the same persisted random_id; even an ambiguous 5xx cannot
+        # duplicate a VK message through this per-request idempotency key.
+        return exc.status == HTTP_TOO_MANY_REQUESTS or exc.status >= HTTP_SERVER_ERROR_MIN
     return isinstance(exc, VkApiError) and exc.code in {6, 10}
 
 

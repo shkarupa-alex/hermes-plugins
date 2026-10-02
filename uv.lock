@@ -640,7 +640,7 @@ dependencies = [
 requires-dist = [
     { name = "filelock", specifier = ">=4.0.9,<5" },
     { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=0a374d167424cdc730ce9761368b62255b551e58" },
-    { name = "huggingface-hub", specifier = ">=2.1.1,<3" },
+    { name = "huggingface-hub", specifier = ">=1.24.0,<3" },
     { name = "onnx-asr", extras = ["cpu"], specifier = ">=0.12.0,<0.13" },
     { name = "onnxruntime", specifier = ">=1.30.0,<1.31" },
     { name = "packaging", specifier = ">=26.0,<27" },
