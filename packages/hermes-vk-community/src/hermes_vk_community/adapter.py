@@ -173,6 +173,17 @@ class VkCommunityAdapter(BasePlatformAdapter):
         await self._stop_polling()
         await self._close_resources(release_lock=True)
 
+    def _delivery_target_error(self, chat_id: str) -> SendResult | None:
+        # Cron can bypass send_once through a live gateway adapter. Apply the
+        # private-user policy before rendering, reading files, or uploading.
+        if chat_id not in self._allow_from:
+            return SendResult(
+                success=False,
+                error="VK delivery target must be an allowed private-message user ID",
+                retryable=False,
+            )
+        return None
+
     async def send_once(
         self,
         chat_id: str,
@@ -182,8 +193,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         force_document: bool = False,
     ) -> dict[str, object]:
         """Use the durable outbound pipeline without taking the receiver lock."""
-        if chat_id not in self._allow_from:
-            return {"error": "VK delivery target must be an allowed private-message user ID"}
+        if denied := self._delivery_target_error(chat_id):
+            return {"error": denied.error}
         token = get_secret("VK_COMMUNITY_TOKEN")
         if not token:
             return {"error": "VK_COMMUNITY_TOKEN is missing"}
@@ -240,6 +251,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         del metadata
+        if denied := self._delivery_target_error(chat_id):
+            return denied
         if self._client is None or self._storage is None:
             return SendResult(
                 success=False, error="VK adapter is not connected", retryable=True, error_kind="transient"
@@ -755,6 +768,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: dict[str, Any] | None,
     ) -> SendResult:
+        if denied := self._delivery_target_error(chat_id):
+            return denied
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
         peer_id = int(chat_id)
@@ -800,6 +815,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
+        if denied := self._delivery_target_error(chat_id):
+            return denied
         if self._client is None:
             return SendResult(success=False, error="VK adapter is not connected", retryable=True)
         downloaded = None
@@ -822,6 +839,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         **kwargs: Any,  # noqa: ANN401 - exact Hermes compatibility contract
     ) -> SendResult:
         del metadata, kwargs
+        if denied := self._delivery_target_error(chat_id):
+            return denied
         try:
             attachment = await self._upload_photo(int(chat_id), Path(image_path))
         except Exception as exc:  # noqa: BLE001
@@ -839,6 +858,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         **kwargs: Any,  # noqa: ANN401 - exact Hermes compatibility contract
     ) -> SendResult:
         del metadata, kwargs
+        if denied := self._delivery_target_error(chat_id):
+            return denied
         try:
             attachment = await self._upload_document(int(chat_id), Path(file_path), file_name=file_name)
         except Exception as exc:  # noqa: BLE001
@@ -855,6 +876,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
         **kwargs: Any,  # noqa: ANN401 - exact Hermes compatibility contract
     ) -> SendResult:
         del metadata, kwargs
+        if denied := self._delivery_target_error(chat_id):
+            return denied
         source = Path(audio_path)
         try:
             with tempfile.TemporaryDirectory(prefix="hermes-vk-voice-") as directory:

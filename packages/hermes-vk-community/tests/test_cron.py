@@ -5,13 +5,16 @@ import importlib
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from gateway.config import HomeChannel, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.platforms.base import SendResult
 
 from hermes_vk_community import adapter as adapter_module
+from hermes_vk_community import plugin as plugin_module
 from hermes_vk_community.adapter import VkCommunityAdapter
 from hermes_vk_community.plugin import build_adapter, register, send_standalone
+from hermes_vk_community.storage import VkStorage
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -96,6 +99,97 @@ async def test_standalone_rejects_non_allowlisted_target_before_io(
 ) -> None:
     assert "error" in await send_standalone(_config(tmp_path), chat_id, "Отчёт")
     assert delivery_client == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id", ["456", "999", "2000000001", "-456", "vk.com/id456"])
+async def test_live_cron_delivery_enforces_private_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chat_id: str,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = _config(tmp_path)
+    instance = build_adapter(config)
+    sent: list[object] = []
+
+    async def transport(_self: VkCommunityAdapter, params: dict[str, object]) -> object:
+        sent.append(params["peer_id"])
+        return 42
+
+    monkeypatch.setattr(VkCommunityAdapter, "_send_chunk", transport)
+    # Use the genuine outbound pipeline and storage; replace only network I/O.
+    instance._client = cast("Any", object())
+    instance._storage = VkStorage(tmp_path / "state.sqlite3")
+    await instance._storage.open()
+    try:
+        platform = Platform("vk")
+        router = DeliveryRouter(GatewayConfig(platforms={platform: config}), adapters={platform: instance})
+        target = DeliveryTarget(platform=platform, chat_id=chat_id, is_explicit=True)
+        if chat_id == "456":
+            await router._deliver_to_platform(target, "Отчёт", {"job_id": "test"})
+            assert sent == [456]
+        else:
+            with pytest.raises(RuntimeError, match="allowed private-message user ID"):
+                await router._deliver_to_platform(target, "Отчёт", {"job_id": "test"})
+            assert sent == []
+    finally:
+        await instance._storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_id", ["999", "2000000001"])
+@pytest.mark.parametrize("method", ["send_image", "send_image_file", "send_document", "send_voice"])
+async def test_live_media_rejects_non_allowlisted_target_before_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chat_id: str,
+    method: str,
+) -> None:
+    instance = build_adapter(_config(tmp_path))
+
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("unauthorized outbound media reached file or network I/O")
+
+    monkeypatch.setattr(VkCommunityAdapter, "_upload_photo", forbidden)
+    monkeypatch.setattr(VkCommunityAdapter, "_upload_document", forbidden)
+    monkeypatch.setattr(adapter_module, "_convert_voice_to_ogg", forbidden)
+
+    class Client:
+        download_media = staticmethod(forbidden)
+
+    instance._client = cast("Any", Client())
+    sender = getattr(instance, method)
+    result = await sender(chat_id, "unused-media-path")
+    assert not result.success
+    assert "allowed private-message user ID" in result.error
+
+
+@pytest.mark.asyncio
+async def test_hermes_standalone_media_requires_nonempty_report_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import send_message_tool
+
+    sent: list[str] = []
+
+    async def sender(_config: PlatformConfig, _chat_id: str, message: str, **_kwargs: object) -> dict[str, object]:
+        sent.append(message)
+        return {"success": True, "media_delivered": True}
+
+    monkeypatch.setattr(plugin_module, "send_standalone", sender)
+    config = _config(tmp_path)
+    report = tmp_path / "report.csv"
+    report.write_text("value\n1\n", encoding="utf-8")
+    route = cast("Any", send_message_tool)._send_to_platform
+    media = [(str(report), False)]
+    result = await route(Platform("vk"), config, "456", "", media_files=media)
+    assert "target vk had only media attachments" in result["error"]
+    assert sent == []
+    result = await route(Platform("vk"), config, "456", "Отчёт", media_files=media)
+    assert result["success"]
+    assert sent == ["Отчёт"]
 
 
 @pytest.mark.asyncio
