@@ -485,6 +485,56 @@ async def test_cancellation_before_dispatch_is_not_delivery_unknown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["send", "direct"])
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_cancelled_initial_outbox_commit_cannot_be_recovered(
+    tmp_path: Path, lane: str, *, repeat_cancel: bool
+) -> None:
+    adapter = _adapter()
+    adapter._effective_limit = 256
+    storage = VkStorage(tmp_path / "state.sqlite3")
+    await storage.open()
+    adapter._storage = storage
+    adapter._client = cast("Any", object())
+    calls: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    cancel_count = 0
+
+    async def transport(params: dict[str, object]) -> object:
+        calls.append(params)
+        return 42
+
+    def cancel_on_commit(statement: str) -> None:
+        nonlocal cancel_count
+        if statement == "COMMIT" and (cancel_count == 0 or (repeat_cancel and cancel_count == 1)):
+            cancel_count += 1
+            loop.call_soon_threadsafe(task.cancel)
+
+    adapter._send_chunk = transport
+    await cast("Any", storage._connection()).set_trace_callback(cancel_on_commit)
+    operation = (
+        adapter.send("456", "x" * 600) if lane == "send" else adapter._send_direct(456, "caption", attachment="doc1_1")
+    )
+    task = asyncio.create_task(operation)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cancel_count == (2 if repeat_cancel else 1)
+        assert calls == []
+        assert len(await storage.diagnostic_rows(outbox_state="failed")) == (3 if lane == "send" else 1)
+        await storage.close()
+        await storage.open()
+        assert await storage.prepared_outbox() == []
+        assert (await storage.counts())["outbox_delivery_unknown"] == 0
+        await adapter._recover_prepared_outbox()
+        assert calls == []
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_error_914_progressively_reduces_and_caches_limit(tmp_path: Path) -> None:
     adapter = _adapter()
     storage = VkStorage(tmp_path / "state.sqlite3")

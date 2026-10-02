@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import aiosqlite
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Awaitable, Callable
     from pathlib import Path
 
     from hermes_vk_community.models import JsonObject
@@ -230,7 +230,9 @@ class VkStorage:
         return self._db
 
     @asynccontextmanager
-    async def _transaction(self) -> AsyncGenerator[aiosqlite.Connection, None]:
+    async def _transaction(
+        self, *, on_cancel: Callable[[aiosqlite.Connection], Awaitable[None]] | None = None
+    ) -> AsyncGenerator[aiosqlite.Connection, None]:
         # aiosqlite queues statements, not whole coroutine transactions. Every
         # writer owns the connection until commit/rollback; readers use the same
         # lock so they cannot act on another coroutine's uncommitted records.
@@ -240,6 +242,27 @@ class VkStorage:
                 await db.execute("BEGIN IMMEDIATE")
                 yield db
                 await db.commit()
+            except asyncio.CancelledError:
+
+                async def settle() -> None:
+                    # aiosqlite's worker may have committed before cancellation
+                    # reached the waiter. FIFO rollback settles that outcome;
+                    # preparation still owns its invocation and can retire it.
+                    await db.rollback()
+                    if on_cancel is not None:
+                        await on_cancel(db)
+                        await db.commit()
+
+                cleanup = asyncio.create_task(settle())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        # Retain the connection lock even if shutdown cancels
+                        # this task again while the worker finishes cleanup.
+                        continue
+                cleanup.result()
+                raise
             except BaseException:
                 await db.rollback()
                 raise
@@ -331,7 +354,19 @@ class VkStorage:
         formats = format_data or [None] * len(chunks)
         if len(formats) != len(chunks):
             raise ValueError("format_data must align with chunks")
-        async with self._transaction() as db:
+
+        async def cancel_preparation(db: aiosqlite.Connection) -> None:
+            await db.execute(
+                "UPDATE outbox SET state='failed',error=?,updated_at_ms=? WHERE invocation_id=? AND state=?",
+                (
+                    "outbox preparation cancelled before dispatch",
+                    _now_ms(),
+                    invocation_id,
+                    "prepared" if recoverable else "sending",
+                ),
+            )
+
+        async with self._transaction(on_cancel=cancel_preparation) as db:
             first_index = 0
             if replace_rejected is not None:
                 if not recoverable or not chunks:
