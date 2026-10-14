@@ -81,7 +81,7 @@ jobs:
         run: python tools/release_version.py verify-artifacts "$RELEASE_TAG" dist
 
       - name: Upload release distributions
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-dists
           path: dist/

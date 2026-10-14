@@ -104,7 +104,7 @@ jobs:
       - run: uv run --no-sync python tools/asr_corpus_gate.py release-corpus/manifest.jsonl --baseline release-corpus/baseline.json --output release-corpus/result.json
       - name: Preserve corpus metrics
         if: ${{ always() && hashFiles('release-corpus/result.json') != '' }}
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: asr-corpus-result
           path: release-corpus/result.json
