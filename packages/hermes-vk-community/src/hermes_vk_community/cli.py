@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent.secret_scope import get_secret
-from gateway.status import acquire_scoped_lock, release_scoped_lock
+from gateway.status import acquire_scoped_lock
 from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
 from pydantic import TypeAdapter
@@ -32,6 +32,13 @@ from hermes_vk_community.setup import (
     validate_long_poll_capabilities,
 )
 from hermes_vk_community.storage import VkStorage
+
+try:
+    from gateway.status_scoped_locks import (  # pyright: ignore[reportMissingImports]
+        release_scoped_lock,  # pyright: ignore[reportUnknownVariableType]
+    )
+except ImportError:  # Hermes hosts before release_scoped_lock moved out of gateway.status
+    from gateway.status import release_scoped_lock
 
 MIN_PAIRING_TTL = 60
 MAX_PAIRING_TTL = 86_400
