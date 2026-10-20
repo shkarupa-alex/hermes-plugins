@@ -10,6 +10,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.platforms.base import SendResult
+from PIL import Image
 
 from hermes_vk_community.adapter import (
     VkCommunityAdapter,
@@ -1316,3 +1317,62 @@ def test_upload_error_names_vk_failures_but_not_other_exception_text() -> None:
     assert _upload_error("voice", ValueError("https://pu.vk.com/upload?sig=secret")) == (
         "VK voice upload failed: ValueError"
     )
+
+
+class PhotoUploadClientSpy:
+    def __init__(self, photos: list[str]) -> None:
+        self.photos = photos
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.upload_urls: list[str] = []
+
+    async def call(self, method: str, params: dict[str, object]) -> object:
+        self.calls.append((method, params))
+        if method == "photos.getMessagesUploadServer":
+            return {"upload_url": f"https://pu.vk.com/upload/{len(self.calls)}"}
+        assert method == "photos.saveMessagesPhoto"
+        return [{"owner_id": 1, "id": 2, "access_key": "k"}]
+
+    async def upload_file(self, url: str, field: str, path: Path, **kwargs: object) -> object:
+        del field, path, kwargs
+        self.upload_urls.append(url)
+        return {"server": 7, "photo": self.photos.pop(0), "hash": "h"}
+
+
+def _png(tmp_path: Path) -> Path:
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (4, 4)).save(path)
+    return path
+
+
+@pytest.mark.asyncio
+async def test_photo_upload_retries_fresh_server_when_vk_returns_no_photo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("hermes_vk_community.adapter.PHOTO_UPLOAD_RETRY_DELAY_SECONDS", 0)
+    adapter = _adapter()
+    client = PhotoUploadClientSpy(["", '[{"photo":"ok"}]'])
+    adapter._client = cast("VkApiClient", client)
+
+    assert await adapter._upload_photo(456, _png(tmp_path)) == "photo1_2_k"
+    assert len(set(client.upload_urls)) == 2
+    assert [method for method, _ in client.calls] == [
+        "photos.getMessagesUploadServer",
+        "photos.getMessagesUploadServer",
+        "photos.saveMessagesPhoto",
+    ]
+    assert client.calls[-1][1]["photo"] == '[{"photo":"ok"}]'
+
+
+@pytest.mark.asyncio
+async def test_photo_upload_gives_up_without_saving_when_vk_never_returns_a_photo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("hermes_vk_community.adapter.PHOTO_UPLOAD_RETRY_DELAY_SECONDS", 0)
+    adapter = _adapter()
+    client = PhotoUploadClientSpy(["", "[]", ""])
+    adapter._client = cast("VkApiClient", client)
+
+    with pytest.raises(ValueError, match="returned no photo"):
+        await adapter._upload_photo(456, _png(tmp_path))
+    assert len(client.upload_urls) == 3
+    assert all(method == "photos.getMessagesUploadServer" for method, _ in client.calls)

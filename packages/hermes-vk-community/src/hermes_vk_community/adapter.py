@@ -88,6 +88,8 @@ MAX_APPROVAL_PREVIEW = 800
 MAX_PAIRING_TEXT = 128
 MAX_GEO_COORDINATES_LENGTH = 128
 CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS = 15.0
+PHOTO_UPLOAD_ATTEMPTS = 3
+PHOTO_UPLOAD_RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1123,26 +1125,36 @@ class VkCommunityAdapter(BasePlatformAdapter):
     async def _upload_photo(self, peer_id: int, path: Path) -> str:
         if self._client is None:
             raise RuntimeError("VK client is not connected")
-        server = UploadServer.model_validate(
-            await self._safe_api_call("photos.getMessagesUploadServer", {"peer_id": peer_id})
-        )
         mime = await asyncio.to_thread(_sniff_mime, path)
         if mime is None or not mime.startswith("image/"):
             raise ValueError("VK photo upload requires a sniffed image MIME type")
         extension = await asyncio.to_thread(_sniff_extension, path)
-        try:
-            uploaded = PhotoUploadResponse.model_validate(
-                await self._client.upload_file(
-                    server.upload_url,
-                    "photo",
-                    path,
-                    content_type=mime,
-                    filename=f"photo.{extension}" if extension else "photo",
-                )
+        # VK's upload server sometimes accepts a valid image yet answers with an empty photo list, which
+        # photos.saveMessagesPhoto rejects with error 100. A fresh upload of the same file then succeeds.
+        for attempt in range(1, PHOTO_UPLOAD_ATTEMPTS + 1):
+            server = UploadServer.model_validate(
+                await self._safe_api_call("photos.getMessagesUploadServer", {"peer_id": peer_id})
             )
-        except Exception as exc:
-            await self._record_orphan("photo-upload", peer_id, await asyncio.to_thread(_file_sha256, path), exc)
-            raise
+            try:
+                uploaded = PhotoUploadResponse.model_validate(
+                    await self._client.upload_file(
+                        server.upload_url,
+                        "photo",
+                        path,
+                        content_type=mime,
+                        filename=f"photo.{extension}" if extension else "photo",
+                    )
+                )
+            except Exception as exc:
+                await self._record_orphan("photo-upload", peer_id, await asyncio.to_thread(_file_sha256, path), exc)
+                raise
+            if uploaded.photo not in {"", "[]"}:
+                break
+            logger.warning("[vk] photo upload returned no photo (attempt %d/%d)", attempt, PHOTO_UPLOAD_ATTEMPTS)
+            if attempt < PHOTO_UPLOAD_ATTEMPTS:
+                await asyncio.sleep(PHOTO_UPLOAD_RETRY_DELAY_SECONDS * attempt)
+        else:
+            raise ValueError("VK upload server returned no photo")
         try:
             saved = TypeAdapter(list[SavedPhoto]).validate_python(
                 await self._client.call(
