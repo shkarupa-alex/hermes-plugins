@@ -31,6 +31,9 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 MAX_MEDIA_REDIRECTS = 3
 HTTP_REDIRECT_MIN = 300
 HTTP_ERROR_MIN = 400
+HTTP_SERVER_ERROR_MIN = 500
+TRANSIENT_MEDIA_STATUSES = frozenset({404, 429})
+MEDIA_DOWNLOAD_RETRY_DELAYS_SECONDS = (1.0, 2.0, 4.0, 4.0)
 
 
 def _parse_long_poll_lease(payload: object) -> LongPollLease:
@@ -45,6 +48,10 @@ def _parse_long_poll_response(payload: object) -> LongPollResponse:
         return LongPollResponse.model_validate(payload)
     except ValidationError as exc:
         raise VkLongPollProtocolError("VK Long Poll response has an invalid schema") from exc
+
+
+def _is_transient_media_status(status: int) -> bool:
+    return status in TRANSIENT_MEDIA_STATUSES or status >= HTTP_SERVER_ERROR_MIN
 
 
 def _connector(resolver: AbstractResolver) -> aiohttp.TCPConnector:
@@ -148,6 +155,19 @@ class VkApiClient:
             await resolver.close()
 
     async def download_media(self, url: str) -> DownloadedMedia:
+        # VK's CDN serves a freshly uploaded file intermittently: the same URL flips between 404, 5xx and 200
+        # for several seconds. Retry those answers with backoff; every other failure is final at once.
+        for delay in MEDIA_DOWNLOAD_RETRY_DELAYS_SECONDS:
+            try:
+                return await self._download_media_once(url)
+            except VkHttpError as exc:
+                if exc.operation != "media download" or not _is_transient_media_status(exc.status):
+                    raise
+                logger.debug("[vk] media download HTTP %d; retrying in %.0f s", exc.status, delay)
+            await asyncio.sleep(delay)
+        return await self._download_media_once(url)
+
+    async def _download_media_once(self, url: str) -> DownloadedMedia:
         current_url = url
         for redirect_count in range(MAX_MEDIA_REDIRECTS + 1):
             validate_https_url(current_url, suffixes=MEDIA_SUFFIXES)
