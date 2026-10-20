@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import stat
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Self, cast
 
@@ -14,7 +15,7 @@ from hermes_vk_community.client import (
     _parse_long_poll_response,
     _stream_limited_to_temp,
 )
-from hermes_vk_community.errors import VkLongPollProtocolError, VkSecurityError
+from hermes_vk_community.errors import VkHttpError, VkLongPollProtocolError, VkSecurityError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -153,3 +154,58 @@ async def test_media_redirects_are_manual_proxy_free_and_revalidated(
     ]
     assert len(session_options) == 2
     assert all(options["trust_env"] is False for options in session_options)
+
+
+def _scripted_downloads(
+    monkeypatch: pytest.MonkeyPatch, client: VkApiClient, outcomes: list[VkHttpError | DownloadedMedia]
+) -> list[str]:
+    calls: list[str] = []
+
+    async def once(url: str) -> DownloadedMedia:
+        calls.append(url)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, VkHttpError):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(client, "_download_media_once", once)
+    monkeypatch.setattr("hermes_vk_community.client.MEDIA_DOWNLOAD_RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0, 0.0))
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_media_download_retries_cdn_answers_for_a_fresh_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = VkApiClient("token")
+    media = DownloadedMedia(Path(os.devnull), "image/jpeg", "https://sun9-1.userapi.com/p.jpg")
+    calls = _scripted_downloads(
+        monkeypatch,
+        client,
+        [VkHttpError(404, "media download"), VkHttpError(504, "media download"), media],
+    )
+
+    assert await client.download_media("https://sun9-1.userapi.com/p.jpg") is media
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [VkHttpError(403, "media download"), VkHttpError(404, "media redirect")])
+async def test_media_download_does_not_retry_other_failures(
+    monkeypatch: pytest.MonkeyPatch, error: VkHttpError
+) -> None:
+    client = VkApiClient("token")
+    calls = _scripted_downloads(monkeypatch, client, [error])
+
+    with pytest.raises(VkHttpError) as raised:
+        await client.download_media("https://sun9-1.userapi.com/p.jpg")
+    assert raised.value is error
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_media_download_gives_up_after_bounded_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = VkApiClient("token")
+    calls = _scripted_downloads(monkeypatch, client, [VkHttpError(404, "media download") for _ in range(5)])
+
+    with pytest.raises(VkHttpError, match="404"):
+        await client.download_media("https://sun9-1.userapi.com/p.jpg")
+    assert len(calls) == 5

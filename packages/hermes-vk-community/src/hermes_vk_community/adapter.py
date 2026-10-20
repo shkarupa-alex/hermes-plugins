@@ -88,6 +88,8 @@ MAX_APPROVAL_PREVIEW = 800
 MAX_PAIRING_TEXT = 128
 MAX_GEO_COORDINATES_LENGTH = 128
 CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS = 15.0
+PHOTO_UPLOAD_ATTEMPTS = 3
+PHOTO_UPLOAD_RETRY_DELAY_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1065,7 +1067,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         try:
             attachment = await self._upload_photo(int(chat_id), Path(image_path))
         except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"VK photo upload failed: {type(exc).__name__}", retryable=False)
+            return SendResult(success=False, error=_upload_error("photo", exc), retryable=False)
         return await self._send_direct(int(chat_id), caption or "", reply_to=reply_to, attachment=attachment)
 
     async def send_document(  # noqa: PLR0913, PLR0917 - exact Hermes compatibility contract
@@ -1084,7 +1086,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         try:
             attachment = await self._upload_document(int(chat_id), Path(file_path), file_name=file_name)
         except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"VK document upload failed: {type(exc).__name__}", retryable=False)
+            return SendResult(success=False, error=_upload_error("document", exc), retryable=False)
         return await self._send_direct(int(chat_id), caption or "", reply_to=reply_to, attachment=attachment)
 
     async def send_voice(
@@ -1116,33 +1118,43 @@ class VkCommunityAdapter(BasePlatformAdapter):
             except Exception as fallback_error:  # noqa: BLE001
                 return SendResult(
                     success=False,
-                    error=f"VK voice upload failed: {type(fallback_error).__name__}",
+                    error=_upload_error("voice", fallback_error),
                     retryable=False,
                 )
 
     async def _upload_photo(self, peer_id: int, path: Path) -> str:
         if self._client is None:
             raise RuntimeError("VK client is not connected")
-        server = UploadServer.model_validate(
-            await self._safe_api_call("photos.getMessagesUploadServer", {"peer_id": peer_id})
-        )
         mime = await asyncio.to_thread(_sniff_mime, path)
         if mime is None or not mime.startswith("image/"):
             raise ValueError("VK photo upload requires a sniffed image MIME type")
         extension = await asyncio.to_thread(_sniff_extension, path)
-        try:
-            uploaded = PhotoUploadResponse.model_validate(
-                await self._client.upload_file(
-                    server.upload_url,
-                    "photo",
-                    path,
-                    content_type=mime,
-                    filename=f"photo.{extension}" if extension else "photo",
-                )
+        # VK's upload server sometimes accepts a valid image yet answers with an empty photo list, which
+        # photos.saveMessagesPhoto rejects with error 100. A fresh upload of the same file then succeeds.
+        for attempt in range(1, PHOTO_UPLOAD_ATTEMPTS + 1):
+            server = UploadServer.model_validate(
+                await self._safe_api_call("photos.getMessagesUploadServer", {"peer_id": peer_id})
             )
-        except Exception as exc:
-            await self._record_orphan("photo-upload", peer_id, await asyncio.to_thread(_file_sha256, path), exc)
-            raise
+            try:
+                uploaded = PhotoUploadResponse.model_validate(
+                    await self._client.upload_file(
+                        server.upload_url,
+                        "photo",
+                        path,
+                        content_type=mime,
+                        filename=f"photo.{extension}" if extension else "photo",
+                    )
+                )
+            except Exception as exc:
+                await self._record_orphan("photo-upload", peer_id, await asyncio.to_thread(_file_sha256, path), exc)
+                raise
+            if uploaded.photo not in {"", "[]"}:
+                break
+            logger.warning("[vk] photo upload returned no photo (attempt %d/%d)", attempt, PHOTO_UPLOAD_ATTEMPTS)
+            if attempt < PHOTO_UPLOAD_ATTEMPTS:
+                await asyncio.sleep(PHOTO_UPLOAD_RETRY_DELAY_SECONDS * attempt)
+        else:
+            raise ValueError("VK upload server returned no photo")
         try:
             saved = TypeAdapter(list[SavedPhoto]).validate_python(
                 await self._client.call(
@@ -1525,6 +1537,12 @@ def _message_id(payload: object) -> str:
     if not isinstance(payload, int):
         raise TypeError("VK messages.send returned no message_id")
     return str(payload)
+
+
+def _upload_error(kind: str, exc: Exception) -> str:
+    # VK API and HTTP errors carry only VK's own code and text; other exceptions may embed upload URLs.
+    detail = str(exc) if isinstance(exc, VkApiError | VkHttpError) else type(exc).__name__
+    return f"VK {kind} upload failed: {detail}"
 
 
 def _attachment_id(kind: str, owner_id: int, object_id: int, access_key: str | None) -> str:
