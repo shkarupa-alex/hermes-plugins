@@ -1065,7 +1065,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         try:
             attachment = await self._upload_photo(int(chat_id), Path(image_path))
         except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"VK photo upload failed: {type(exc).__name__}", retryable=False)
+            return SendResult(success=False, error=_upload_error("photo", exc), retryable=False)
         return await self._send_direct(int(chat_id), caption or "", reply_to=reply_to, attachment=attachment)
 
     async def send_document(  # noqa: PLR0913, PLR0917 - exact Hermes compatibility contract
@@ -1084,7 +1084,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
         try:
             attachment = await self._upload_document(int(chat_id), Path(file_path), file_name=file_name)
         except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=f"VK document upload failed: {type(exc).__name__}", retryable=False)
+            return SendResult(success=False, error=_upload_error("document", exc), retryable=False)
         return await self._send_direct(int(chat_id), caption or "", reply_to=reply_to, attachment=attachment)
 
     async def send_voice(
@@ -1116,7 +1116,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             except Exception as fallback_error:  # noqa: BLE001
                 return SendResult(
                     success=False,
-                    error=f"VK voice upload failed: {type(fallback_error).__name__}",
+                    error=_upload_error("voice", fallback_error),
                     retryable=False,
                 )
 
@@ -1525,6 +1525,12 @@ def _message_id(payload: object) -> str:
     if not isinstance(payload, int):
         raise TypeError("VK messages.send returned no message_id")
     return str(payload)
+
+
+def _upload_error(kind: str, exc: Exception) -> str:
+    # VK API and HTTP errors carry only VK's own code and text; other exceptions may embed upload URLs.
+    detail = str(exc) if isinstance(exc, VkApiError | VkHttpError) else type(exc).__name__
+    return f"VK {kind} upload failed: {detail}"
 
 
 def _attachment_id(kind: str, owner_id: int, object_id: int, access_key: str | None) -> str:

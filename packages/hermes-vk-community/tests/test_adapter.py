@@ -20,6 +20,7 @@ from hermes_vk_community.adapter import (
     _is_retryable_poll_error,
     _is_retryable_send_error,
     _source_prefix_for_rendered,
+    _upload_error,
 )
 from hermes_vk_community.errors import VkApiError, VkDeliveryUnknownError, VkHttpError, VkLongPollProtocolError
 from hermes_vk_community.models import InteractionPayload, LongPollLease, LongPollResponse, VkAttachment, VkMessage
@@ -1303,3 +1304,15 @@ async def test_final_edit_with_table_sends_ordered_fresh_final_and_removes_previ
         assert client.calls[3][1]["message_ids"] == 99
     finally:
         await storage.close()
+
+
+def test_upload_error_names_vk_failures_but_not_other_exception_text() -> None:
+    assert _upload_error("photo", VkApiError(100, "photos_list is invalid")) == (
+        "VK photo upload failed: VK API error 100: photos_list is invalid"
+    )
+    assert (
+        _upload_error("document", VkHttpError(502, "upload")) == "VK document upload failed: VK upload HTTP error 502"
+    )
+    assert _upload_error("voice", ValueError("https://pu.vk.com/upload?sig=secret")) == (
+        "VK voice upload failed: ValueError"
+    )
