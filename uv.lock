@@ -714,7 +714,7 @@ requires-dist = [
     { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=0a374d167424cdc730ce9761368b62255b551e58" },
     { name = "markdown-it-py", specifier = ">=4.2.0,<5" },
     { name = "packaging", specifier = ">=26.0,<27" },
-    { name = "pillow", specifier = ">=13.0.0,<14" },
+    { name = "pillow", specifier = ">=12.2,<14" },
     { name = "pydantic", specifier = ">=2.13.4,<3" },
     { name = "pydantic-settings", specifier = ">=2.15.0,<3" },
     { name = "tenacity", specifier = "==9.1.4" },
