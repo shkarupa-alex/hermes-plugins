@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Any, cast
 import aiosqlite
 import pytest
 
-from hermes_vk_community.storage import MAX_NORMALIZED_JSON_LENGTH, VkStorage, canonical_json
+from hermes_vk_community.storage import (
+    MAX_NORMALIZED_JSON_LENGTH,
+    OutboxOwnershipLostError,
+    VkStorage,
+    canonical_json,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -80,6 +85,38 @@ async def test_recovery_requires_a_recoverable_or_confirmed_prefix(tmp_path: Pat
         assert [row.id for row in recovered] == [row.id for row in expected]
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_claim_rechecks_state_and_prefix_across_connections(tmp_path: Path) -> None:
+    source, recovery = VkStorage(tmp_path / "state.sqlite3"), VkStorage(tmp_path / "state.sqlite3")
+    await source.open()
+    await recovery.open(recover_inflight=False)
+    try:
+        head, tail = await source.prepare_outbox(2, ["head", "tail"], None)
+        await source.mark_outbox(head.id, "sending")
+        with pytest.raises(OutboxOwnershipLostError):
+            await recovery.mark_outbox(head.id, "sending")
+        with pytest.raises(OutboxOwnershipLostError):
+            await recovery.mark_outbox(tail.id, "sending")
+        # A cancelled contender has no proof that it owns the in-flight head.
+        assert not await recovery.terminalize_outbox_failure(
+            head, "failed", "cancelled before claim", [tail], "blocked", require_prepared=True
+        )
+        assert not await recovery.terminalize_outbox_failure(
+            tail, "failed", "cancelled behind another sender", [], "blocked", require_prepared=True
+        )
+        assert len(await source.diagnostic_rows(outbox_state="sending")) == 1
+        assert len(await source.diagnostic_rows(outbox_state="prepared")) == 1
+        await source.mark_outbox(head.id, "sent", message_id="1")
+        await recovery.mark_outbox(tail.id, "sending")
+        await recovery.mark_outbox(tail.id, "sent", message_id="2")
+        with pytest.raises(OutboxOwnershipLostError):
+            await source.mark_outbox(tail.id, "sending")
+        assert len(await source.diagnostic_rows(outbox_state="sent")) == 2
+    finally:
+        await source.close()
+        await recovery.close()
 
 
 @pytest.mark.asyncio

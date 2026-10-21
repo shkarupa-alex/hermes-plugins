@@ -383,12 +383,19 @@ class VkCommunityAdapter(BasePlatformAdapter):
         tail_error: str,
         *,
         replacement_token: str | None = None,
+        require_prepared: bool = False,
     ) -> bool | None:
         if self._storage is None:
             return None
         try:
             return await self._storage.terminalize_outbox_failure(
-                record, state, error, tail_records, tail_error, replacement_token=replacement_token
+                record,
+                state,
+                error,
+                tail_records,
+                tail_error,
+                replacement_token=replacement_token,
+                require_prepared=require_prepared,
             )
         except Exception as exc:
             logger.warning("[vk] failed to persist send diagnostics: %s", type(exc).__name__, exc_info=True)
@@ -408,7 +415,13 @@ class VkCommunityAdapter(BasePlatformAdapter):
             try:
                 async with asyncio.timeout(CANCELLED_SEND_CLEANUP_TIMEOUT_SECONDS):
                     await self._terminalize_failed_send(
-                        record, state, error, tail_records, tail_error, replacement_token=replacement_token
+                        record,
+                        state,
+                        error,
+                        tail_records,
+                        tail_error,
+                        replacement_token=replacement_token,
+                        require_prepared=state == "failed" and replacement_token is None,
                     )
             except TimeoutError:
                 logger.warning("[vk] cancellation terminalization timed out; remaining outbox rows may be recoverable")
@@ -463,6 +476,12 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 delivered.append(message_id)
                 confirmed_characters = _chunk_end
                 await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
+            except OutboxOwnershipLostError:
+                if delivered:
+                    return _partial_result(
+                        delivered, [item[0] for item in pending], delivered_characters=confirmed_characters
+                    )
+                return _delivery_unknown_result("VK outbox delivery is owned by another sender", record.id)
             except asyncio.CancelledError:
                 await self._terminalize_cancelled_send(
                     record,
@@ -479,6 +498,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     "request timed out",
                     [item[2] for item in pending[index + 1 :]],
                     "blocked after ambiguous earlier chunk",
+                    require_prepared=not dispatched,
                 )
                 if delivered:
                     return _partial_result(
@@ -541,6 +561,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     type(exc).__name__,
                     [item[2] for item in pending[index + 1 :]],
                     "blocked after ambiguous earlier chunk",
+                    require_prepared=not dispatched,
                 )
                 if delivered:
                     return _partial_result(
@@ -591,7 +612,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
             retryable=False,
         )
 
-    async def _send_direct(
+    async def _send_direct(  # noqa: PLR0911 - direct delivery distinguishes claim loss from dispatch failures
         self,
         peer_id: int,
         content: str,
@@ -633,6 +654,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
             confirmed_id = message_id
             await self._storage.mark_outbox(record.id, "sent", message_id=message_id)
             return SendResult(success=True, message_id=message_id, retryable=False)
+        except OutboxOwnershipLostError:
+            return _delivery_unknown_result("VK outbox delivery is owned by another sender", record.id)
         except asyncio.CancelledError:
             await self._terminalize_cancelled_send(
                 record,
@@ -649,7 +672,9 @@ class VkCommunityAdapter(BasePlatformAdapter):
             await self._terminalize_failed_send(record, "failed", _safe_api_error(exc), [], "")
             return _api_error_result(exc)
         except Exception as exc:  # noqa: BLE001 - the request may already have reached VK
-            await self._terminalize_failed_send(record, "delivery_unknown", type(exc).__name__, [], "")
+            await self._terminalize_failed_send(
+                record, "delivery_unknown", type(exc).__name__, [], "", require_prepared=not dispatched
+            )
             if confirmed_id is not None:
                 return _partial_send_result([confirmed_id], {"failed_segment": "storage", "delivered_chunks": 1})
             return _delivery_unknown_result("VK delivery timed out after the request may have started", record.id)
@@ -727,6 +752,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                         denied.error or "recovery target is no longer authorized",
                         [],
                         "blocked after access was revoked before recovery",
+                        require_prepared=True,
                     )
                     blocked_invocations.add(record.invocation_id)
                     record_index += 1
@@ -745,6 +771,8 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     }
                 )
                 await self._storage.mark_outbox(record.id, "sent", message_id=_message_id(response))
+            except OutboxOwnershipLostError:
+                blocked_invocations.add(record.invocation_id)
             except asyncio.CancelledError:
                 await self._terminalize_cancelled_send(
                     record,
@@ -787,6 +815,7 @@ class VkCommunityAdapter(BasePlatformAdapter):
                     type(exc).__name__,
                     [item for item in records[record_index + 1 :] if item.invocation_id == record.invocation_id],
                     "blocked after failed recovery chunk",
+                    require_prepared=not dispatched,
                 )
                 blocked_invocations.add(record.invocation_id)
             record_index += 1

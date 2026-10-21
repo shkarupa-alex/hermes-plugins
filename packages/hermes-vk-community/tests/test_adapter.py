@@ -746,9 +746,18 @@ async def test_repeated_cancellation_settles_outbox_across_a_local_writer_lock( 
         tail_error: str,
         *,
         replacement_token: str | None = None,
+        require_prepared: bool = False,
     ) -> None:
         cleanup_started.set()
-        await original_terminalize(record, state, error, tail_records, tail_error, replacement_token=replacement_token)
+        await original_terminalize(
+            record,
+            state,
+            error,
+            tail_records,
+            tail_error,
+            replacement_token=replacement_token,
+            require_prepared=require_prepared,
+        )
 
     async def transport(params: dict[str, object]) -> object:
         calls.append(params)
