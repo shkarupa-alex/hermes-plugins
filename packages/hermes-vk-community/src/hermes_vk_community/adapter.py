@@ -1405,12 +1405,6 @@ class VkCommunityAdapter(BasePlatformAdapter):
                 reply_to_message_id=str(message.reply_message.get("id")) if message.reply_message else None,
                 media_urls=media_urls,
                 media_types=media_types,
-                metadata={
-                    "vk_event_id": update.event_id,
-                    "vk_format_data": message.format_data,
-                    "vk_reply": message.reply_message,
-                    "vk_forwards": message.fwd_messages,
-                },
             )
             await self._storage.mark_inbox(record.id, "dispatched")
             await self.handle_message(event)
