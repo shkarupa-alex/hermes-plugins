@@ -552,12 +552,20 @@ class VkStorage:
         self, row_id: int, state: str, *, message_id: str | None = None, error: str | None = None
     ) -> None:
         async with self._transaction() as db:
-            await db.execute(
+            # A recovery snapshot can outlive another sender's completion or
+            # terminalization. Only one sender may claim a prepared chunk, and
+            # the current durable prefix must be confirmed before dispatch.
+            cursor = await db.execute(
                 """UPDATE outbox SET state=?,attempt_count=attempt_count+CASE WHEN ?='sending' THEN 1 ELSE 0 END,
                 returned_message_id=?,error=?,updated_at_ms=?
-                WHERE id=?""",
-                (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id),
+                WHERE id=? AND (?!='sending' OR (state='prepared' AND NOT EXISTS (
+                    SELECT 1 FROM outbox AS earlier
+                    WHERE earlier.invocation_id=outbox.invocation_id AND earlier.chunk_index<outbox.chunk_index
+                    AND earlier.state!='sent')))""",
+                (state, state, message_id, (error or "")[:2048] or None, _now_ms(), row_id, state),
             )
+            if state == "sending" and cursor.rowcount != 1:
+                raise OutboxOwnershipLostError("outbox chunk is no longer prepared with a confirmed prefix")
 
     @staticmethod
     async def _owns_outbox_failure(
@@ -580,12 +588,26 @@ class VkStorage:
         tail_error: str,
         *,
         replacement_token: str | None = None,
+        require_prepared: bool = False,
     ) -> bool:
         """Terminate owned chunks atomically, returning False if ownership moved."""
         now = _now_ms()
         async with self._transaction() as db:
             if not await self._owns_outbox_failure(db, record, replacement_token):
                 return False
+            if require_prepared:
+                # Cancellation can hide a committed claim or arrive while a
+                # competing sender owns it. Without proof of dispatch ownership,
+                # leave that sender and its tail intact.
+                async with db.execute(
+                    "SELECT 1 FROM outbox WHERE id=? AND state='prepared' AND NOT EXISTS ("
+                    "SELECT 1 FROM outbox AS earlier WHERE earlier.invocation_id=outbox.invocation_id "
+                    "AND earlier.chunk_index<outbox.chunk_index AND earlier.state!='sent')",
+                    (record.id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None:
+                    return False
             await db.execute(
                 "UPDATE outbox SET state=?,error=?,updated_at_ms=? WHERE id=?",
                 (state, (error or "delivery failed")[:2048], now, record.id),

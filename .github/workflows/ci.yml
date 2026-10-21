@@ -98,17 +98,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv venv --python ${{ matrix.python }}
+      # Model consumer installs: workspace overrides must not hide conflicts
+      # between published plugin requirements and the legacy host's pins.
       - if: matrix.hermes != '0.21.5'
-        run: uv pip install --no-sources "hermes-agent==${{ matrix.hermes }}"
+        run: uv --no-config pip install --no-sources "hermes-agent==${{ matrix.hermes }}"
       - if: matrix.hermes == '0.21.5'
         name: Install frozen Hermes 0.21.5 release
         run: |
           git clone --filter=blob:none --no-checkout --depth 1 --branch v2026.9.24 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent-release"
           git -C "$RUNNER_TEMP/hermes-agent-release" sparse-checkout set agent tools hermes_cli gateway tui_gateway cron acp_adapter plugins providers hermes_platform
           git -C "$RUNNER_TEMP/hermes-agent-release" checkout
-          uv pip install --no-sources --editable "$RUNNER_TEMP/hermes-agent-release"
+          uv --no-config pip install --no-sources --editable "$RUNNER_TEMP/hermes-agent-release"
       - run: >-
-          uv pip install --no-sources --editable packages/hermes-vk-community --editable packages/hermes-onnx-asr
+          uv --no-config pip install --no-sources --editable packages/hermes-vk-community --editable packages/hermes-onnx-asr
           "pytest>=9.1.1" "pytest-asyncio>=1.4.0" "jiwer==4.0.0"
       - run: .venv/bin/python -m pytest -q
 

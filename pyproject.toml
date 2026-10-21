@@ -28,7 +28,15 @@ environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'", "sys_plat
 # PyPI still ships 0.19.0 with a Python <3.14 cap. Freeze the tested Git source.
 # These workspace-only overrides patch upstream pins; plugin installs do not
 # replace the host's dependency policy.
-override-dependencies = ["PyJWT[crypto]>=2.15.0,<3", "pydantic>=2.13.5,<3", "packaging>=26.3,<27"]
+# The frozen host pins vulnerable certifi/Pillow releases; audit the patched
+# versions in both the base workspace and the trace-upload environment.
+override-dependencies = [
+    "PyJWT[crypto]>=2.15.0,<3",
+    "certifi>=2026.10.19",
+    "pillow>=13.0.0,<14",
+    "pydantic>=2.13.5,<3",
+    "packaging>=26.3,<27",
+]
 
 [tool.uv.sources]
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "0a374d167424cdc730ce9761368b62255b551e58" }
