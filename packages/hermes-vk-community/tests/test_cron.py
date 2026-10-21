@@ -24,6 +24,8 @@ from hermes_vk_community.storage import VkStorage
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from hermes_vk_community.storage import OutboxRecord
+
 
 class RegistryContext:
     def register_platform(self, **kwargs: Any) -> None:  # noqa: ANN401 - Hermes registration contract
@@ -664,6 +666,84 @@ async def test_gateway_recovery_cannot_take_an_active_standalone_tail(
         if not task.done():
             await task
         await receiver._storage.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_gateway_recovery_cannot_resurrect_a_failed_standalone_invocation(  # noqa: PLR0915 - real two-connection snapshot/terminalization interleaving
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    config.extra["max_message_length"] = 256
+    source, receiver = build_adapter(config), build_adapter(config)
+    source_storage = VkStorage(tmp_path / "state.sqlite3")
+    receiver_storage = VkStorage(tmp_path / "state.sqlite3")
+    await source_storage.open()
+    await receiver_storage.open()
+    source._storage, receiver._storage = source_storage, receiver_storage
+    source._client = receiver._client = cast("Any", object())
+    prepared, start_source = asyncio.Event(), asyncio.Event()
+    snapshotted, resume_recovery = asyncio.Event(), asyncio.Event()
+    original_prepare = source_storage.prepare_outbox
+    original_snapshot = receiver_storage.prepared_outbox
+    recovery_calls: list[dict[str, object]] = []
+
+    async def prepare_then_pause(
+        peer_id: int,
+        chunks: list[str],
+        reply_target: str | None,
+        **kwargs: Any,  # noqa: ANN401 - preserve the storage preparation contract
+    ) -> list[OutboxRecord]:
+        records = await original_prepare(peer_id, chunks, reply_target, **kwargs)
+        prepared.set()
+        await start_source.wait()
+        return records
+
+    async def snapshot_then_pause() -> list[OutboxRecord]:
+        records = await original_snapshot()
+        snapshotted.set()
+        await resume_recovery.wait()
+        return records
+
+    async def exhausted_refusal(_params: dict[str, object]) -> object:
+        # The real transport can exhaust its retries before a rate limit clears.
+        raise VkApiError(6, "rate limited after transport retries")
+
+    async def recovered(params: dict[str, object]) -> object:
+        recovery_calls.append(params)
+        return len(recovery_calls)
+
+    monkeypatch.setattr(source_storage, "prepare_outbox", prepare_then_pause)
+    monkeypatch.setattr(receiver_storage, "prepared_outbox", snapshot_then_pause)
+    monkeypatch.setattr(source, "_send_chunk", exhausted_refusal)
+    monkeypatch.setattr(receiver, "_send_chunk", recovered)
+    send_task = asyncio.create_task(source.send("456", "x" * 600))
+    recovery_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(prepared.wait(), timeout=5)
+        recovery_task = asyncio.create_task(receiver._recover_prepared_outbox())
+        await asyncio.wait_for(snapshotted.wait(), timeout=5)
+        start_source.set()
+        result = await asyncio.wait_for(send_task, timeout=5)
+        assert not result.success
+        assert result.retryable
+        assert len(await source_storage.diagnostic_rows(outbox_state="failed")) == 3
+        # The caller may now retry with a fresh invocation/random_id. A stale
+        # recovery snapshot must not emit the already-terminalized old report.
+        resume_recovery.set()
+        await asyncio.wait_for(recovery_task, timeout=5)
+        assert recovery_calls == []
+    finally:
+        start_source.set()
+        resume_recovery.set()
+        send_task.cancel()
+        if recovery_task is not None:
+            recovery_task.cancel()
+            await asyncio.gather(send_task, recovery_task, return_exceptions=True)
+        else:
+            await asyncio.gather(send_task, return_exceptions=True)
+        await source_storage.close()
+        await receiver_storage.close()
 
 
 @pytest.mark.asyncio
