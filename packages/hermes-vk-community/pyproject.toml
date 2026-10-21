@@ -18,7 +18,8 @@ dependencies = [
     "hermes-agent>=0",
     "markdown-it-py>=4.2.0,<5",
     "packaging>=26.0,<27",
-    "pillow>=13.0.0,<14",
+    # Legacy Hermes owns an exact Pillow 12 pin; the audited workspace uses 13.
+    "pillow>=12.2,<14",
     "pydantic>=2.13.4,<3",
     "pydantic-settings>=2.15.0,<3",
     "tenacity==9.1.4",
